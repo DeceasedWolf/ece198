@@ -1,0 +1,23 @@
+{
+  "name": "hospitalInducedDelirium",
+  "version": "0.1.0",
+  "description": "Shared Redis key builders and JSON codecs for the hospital lighting demo",
+  "keywords": [
+    "redis",
+    "contracts",
+    "arduino"
+  ],
+  "authors": [
+    {
+      "name": "Mathis"
+    }
+  ],
+  "license": "MIT",
+  "frameworks": "*",
+  "platforms": "*",
+  "build": {
+    "libArchive": false,
+    "includeDir": "include"
+  },
+  "headers": "contracts.hpp"
+}

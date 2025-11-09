@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --save
+      - "60"
+      - "1"
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    environment:
+      - REDIS_REPLICA_READ_ONLY=no
+
+volumes:
+  redis-data:

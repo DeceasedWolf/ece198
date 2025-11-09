@@ -1,0 +1,8 @@
+{
+  "C_Cpp.default.configurationProvider": "platformio",
+  "cmake.configureOnOpen": false,
+  "files.associations": {
+    "*.ino": "cpp"
+  }
+}
+
