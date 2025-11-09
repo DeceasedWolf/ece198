@@ -1,14 +1,13 @@
 # Hospital Lighting Control System
 
-Three PlatformIO projects plus a shared contracts header implement a Redis-driven demo for hospital room lighting. Every room has a local control stack (UNO panel + ESP8266 sender) that publishes desired LED states into Redis, and an ESP8266 receiver that applies the latest snapshot plus future stream updates.
+Two PlatformIO projects plus a shared contracts header implement a Redis-driven demo for hospital room lighting. Each room has an ESP8266 sender that synchronizes time, pulls schedule/configuration data from Redis, computes the desired LED output, and publishes it, while an ESP8266 receiver applies the latest snapshot plus future stream updates.
 
 ## Repository Layout
 
 - `include/config.example.h` - copy to `include/config.h` and edit Wi-Fi/Redis settings.
 - `contracts/` - header-only library with Redis key helpers and JSON codecs.
-- `esp-sender/` - ESP8266 D1 mini that ingests UNO JSON over UART and writes Redis keys/streams.
+- `esp-sender/` - ESP8266 D1 mini scheduler that pulls Redis config, computes desired states, and writes Redis keys/streams.
 - `esp-receiver/` - ESP8266 D1 mini that provisions a room id, applies LED PWM, heartbeats, and acks.
-- `arduino-panel/` - UNO R4 Minima potentiometer/button panel that emits newline JSON frames.
 - `docker/docker-compose.yml` - Redis 7 with AOF enabled for local testing.
 
 ## Quick Start
@@ -23,19 +22,17 @@ Three PlatformIO projects plus a shared contracts header implement a Redis-drive
    ```
    Redis stores data under the named `redis-data` volume with append-only persistence enabled.
 3. Build/flash each PlatformIO environment from the repo root (PlatformIO CLI):
-   ```bash
-   pio run -e uno_panel -t upload
-   pio run -e esp_sender -t upload
-   pio run -e esp_receiver -t upload
-   ```
+```bash
+pio run -e esp_sender -t upload
+pio run -e esp_receiver -t upload
+```
    Open a serial monitor at `115200` when needed (e.g. `pio device monitor -e esp_receiver -b 115200`). You can still run inside a subdirectory with `-d` if you prefer that workflow.
 
 ## Wiring Overview
 
-- **UNO panel + ESP sender**
-  - UNO `Serial1 TX (D1)` -> level shifter -> ESP8266 `RX0`.
-  - UNO `Serial1 RX (D0)` <- level shifter <- ESP8266 `TX0`.
-  - Common ground. Provide 3.3V-friendly signals; never drive the ESP pins directly from 5V.
+- **ESP sender**
+  - Power the D1 mini (or similar ESP8266) from USB or a regulated 3.3 V rail and keep the USB/UART console accessible at `SENDER_CONSOLE_BAUD` so you can answer the `ROOM?` prompt (or just set `ROOM_ID_OVERRIDE`).
+  - No external Arduino panel is required; the sender calculates brightness locally from the Redis schedule and current time.
 - **Receiver LED output**
   - ESP8266 `D4` drives LED PWM. For anything beyond a small indicator LED, use a MOSFET/transistor and a dedicated LED supply rail (include a flyback diode if inductive).
 - **Networking**
@@ -43,17 +40,33 @@ Three PlatformIO projects plus a shared contracts header implement a Redis-drive
 
 ## Firmware Behavior
 
-- **UNO panel**
-  - Reads the potentiometer on `A0` (mapped to 0-100%) and button on `D2` (toggle on/off).
-  - Emits newline-terminated JSON such as `{"mode":"on","brightness":72}` over `Serial1` at `115200`.
-  - Rate limits by only sending when the button toggles, brightness changes by about 2%, or 1s elapses.
-- **ESP sender**
-  - Waits for a `ROOM:<id>` line (forwarded from the receiver) before relaying panel frames.
-  - Seeds the local `ver` counter from `room:{id}:desired`, injects/increments `ver` if absent, mirrors `room` inside each payload, `SET`s the snapshot, `XADD`s `cmd:room:{id}` and applies `XTRIM MAXLEN ~ 200`.
-  - Flushes stalled or overflowing UART frames after 50 ms to avoid partial publishes.
+- **ESP sender (scheduler)**
+  - Prompts for `ROOM:<id>` over USB (or applies `ROOM_ID_OVERRIDE`), synchronizes time via SNTP (`TZ_OFFSET_SECONDS` / `DST_OFFSET_SECONDS`), and polls `room:{id}:cfg` every `SCHEDULE_REFRESH_MS`.
+  - Builds the desired LED state from the wake/night schedule plus the configured baseline brightness and only publishes when the computed state changes. Publishes update snapshots to `room:{id}:desired` plus `cmd:room:{id}` with `XTRIM ~ 200`.
+  - Falls back to the defaults from `include/config.h` whenever no config is available or JSON is invalid, so the room still has a predictable sunrise/night cycle.
 - **ESP receiver**
   - Connects to Wi-Fi/Redis, runs the provisioning Lua (`device:{mac}:room`), prints `ROOM:<id>` over UART, applies the latest desired snapshot, and starts `XREAD BLOCK 1000 STREAMS cmd:room:{id} $`.
   - Drives LED PWM, records `room:{id}:reported`, emits `state:room:{id}` acks, trims streams, and sends `room:{id}:online` heartbeats every 3 s (TTL 10 s). Re-provisions after reconnect and ignores stale `ver`.
+
+## Room Configuration
+
+Room-level settings live at `room:{id}:cfg` as JSON. The sender merges the payload with the defaults from `include/config.h`, so you only need to set what changes per room. Supported fields:
+
+- `baseline.brightness` – percent (0-100) used outside any wake/night window.
+- `wake`: `{ "enabled": true, "hour": 7, "minute": 0, "duration_min": 20, "brightness": 100 }` ramps up from the baseline to `brightness` across `duration_min`.
+- `night`: `{ "enabled": true, "hour": 22, "minute": 0, "brightness": 5 }` forces a low level from the configured time through the next wake window.
+- Optional `version` value is logged for traceability.
+
+Example:
+
+```json
+{
+  "version": 3,
+  "baseline": { "brightness": 0 },
+  "wake": { "enabled": true, "hour": 7, "minute": 0, "duration_min": 30, "brightness": 95 },
+  "night": { "enabled": true, "hour": 22, "minute": 0, "brightness": 8 }
+}
+```
 
 ## Redis Testing Snippets
 
