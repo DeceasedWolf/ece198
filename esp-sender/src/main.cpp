@@ -52,6 +52,46 @@
 #define SCHEDULE_DEFAULT_BASELINE_BRIGHTNESS 0
 #endif
 
+#ifndef QUIET_HOURS_DIM_MINUTES
+#define QUIET_HOURS_DIM_MINUTES 90
+#endif
+
+#ifndef WAKE_BRIGHTEN_MINUTES
+#define WAKE_BRIGHTEN_MINUTES 30
+#endif
+
+#ifndef OVERRIDE_POT_PIN
+#define OVERRIDE_POT_PIN A0
+#endif
+
+#ifndef OVERRIDE_BUTTON_PIN
+#define OVERRIDE_BUTTON_PIN D5
+#endif
+
+#ifndef OVERRIDE_BUTTON_PIN_MODE
+#define OVERRIDE_BUTTON_PIN_MODE INPUT_PULLUP
+#endif
+
+#ifndef OVERRIDE_BUTTON_ACTIVE_LEVEL
+#define OVERRIDE_BUTTON_ACTIVE_LEVEL LOW
+#endif
+
+#ifndef OVERRIDE_BUTTON_DEBOUNCE_MS
+#define OVERRIDE_BUTTON_DEBOUNCE_MS 50
+#endif
+
+#ifndef OVERRIDE_ANALOG_MIN
+#define OVERRIDE_ANALOG_MIN 0
+#endif
+
+#ifndef OVERRIDE_ANALOG_MAX
+#define OVERRIDE_ANALOG_MAX 1023
+#endif
+
+#ifndef OVERRIDE_ANALOG_MIN_DELTA
+#define OVERRIDE_ANALOG_MIN_DELTA 2
+#endif
+
 #ifndef TZ_OFFSET_SECONDS
 #define TZ_OFFSET_SECONDS 0
 #endif
@@ -83,6 +123,13 @@ constexpr unsigned long kConfigRefreshIntervalMs = SCHEDULE_REFRESH_MS;
 constexpr unsigned long kSchedulePublishIntervalMs = SCHEDULE_PUBLISH_MIN_INTERVAL_MS;
 constexpr time_t kMinValidEpoch = 1609459200;  // 2021-01-01
 constexpr uint16_t kMinutesPerDay = 24 * 60;
+constexpr uint32_t kSecondsPerDay = static_cast<uint32_t>(kMinutesPerDay) * 60UL;
+constexpr uint16_t kQuietLeadMinutes = QUIET_HOURS_DIM_MINUTES;
+constexpr uint16_t kWakeLeadMinutes = WAKE_BRIGHTEN_MINUTES;
+constexpr uint16_t kOverrideAnalogMin = OVERRIDE_ANALOG_MIN;
+constexpr uint16_t kOverrideAnalogMax = OVERRIDE_ANALOG_MAX;
+constexpr uint8_t kOverrideAnalogMinDelta = OVERRIDE_ANALOG_MIN_DELTA;
+constexpr unsigned long kOverrideButtonDebounceMs = OVERRIDE_BUTTON_DEBOUNCE_MS;
 
 HardwareSerial &consoleSerial = Serial;
 HardwareSerial &logSerial = Serial;
@@ -115,6 +162,18 @@ bool needsVersionSeed = true;
 uint32_t localVer = 0;
 String jsonScratch;
 contracts::Desired lastDesired;
+bool overridePublishHint = false;
+
+struct OverrideState {
+  bool enabled = false;
+  bool buttonStable = false;
+  bool buttonReading = false;
+  unsigned long buttonLastChangeMs = 0;
+  uint8_t brightness = 0;
+  uint16_t lastAnalogRaw = 0;
+};
+
+OverrideState overrideState;
 
 struct RoomSchedule {
   bool wakeEnabled = true;
@@ -265,6 +324,94 @@ uint16_t clampDurationMinutes(int value) {
     return kMinutesPerDay;
   }
   return static_cast<uint16_t>(value);
+}
+
+bool overrideButtonPressedLevel(int level) {
+  if (OVERRIDE_BUTTON_ACTIVE_LEVEL == LOW) {
+    return level == LOW;
+  }
+  return level == HIGH;
+}
+
+void logOverrideState() {
+  logSerial.print(F("[override] "));
+  logSerial.print(overrideState.enabled ? F("enabled ") : F("disabled "));
+  logSerial.print(F("brightness="));
+  logSerial.print(overrideState.brightness);
+  logSerial.println('%');
+}
+
+uint8_t analogToPercent(uint16_t raw) {
+  uint16_t clamped = raw;
+  if (clamped < kOverrideAnalogMin) {
+    clamped = kOverrideAnalogMin;
+  } else if (clamped > kOverrideAnalogMax) {
+    clamped = kOverrideAnalogMax;
+  }
+  uint16_t span = kOverrideAnalogMax > kOverrideAnalogMin ? (kOverrideAnalogMax - kOverrideAnalogMin) : 1;
+  uint32_t scaled =
+      static_cast<uint32_t>(clamped - kOverrideAnalogMin) * 100UL + static_cast<uint32_t>(span / 2);
+  return static_cast<uint8_t>(scaled / span);
+}
+
+void setOverrideEnabled(bool enabled) {
+  if (overrideState.enabled == enabled) {
+    return;
+  }
+  overrideState.enabled = enabled;
+  overridePublishHint = true;
+  logOverrideState();
+}
+
+void toggleOverride() { setOverrideEnabled(!overrideState.enabled); }
+
+void pollOverrideButton(unsigned long now) {
+  bool pressed = overrideButtonPressedLevel(digitalRead(OVERRIDE_BUTTON_PIN));
+  if (pressed != overrideState.buttonReading) {
+    overrideState.buttonReading = pressed;
+    overrideState.buttonLastChangeMs = now;
+    return;
+  }
+  if (overrideState.buttonStable == pressed) {
+    return;
+  }
+  if ((now - overrideState.buttonLastChangeMs) < kOverrideButtonDebounceMs) {
+    return;
+  }
+  overrideState.buttonStable = pressed;
+  if (pressed) {
+    toggleOverride();
+  }
+}
+
+void pollOverrideAnalog() {
+  uint16_t raw = analogRead(OVERRIDE_POT_PIN);
+  overrideState.lastAnalogRaw = raw;
+  uint8_t percent = analogToPercent(raw);
+  if (percent == overrideState.brightness) {
+    return;
+  }
+  uint8_t prev = overrideState.brightness;
+  uint8_t diff = percent > prev ? percent - prev : prev - percent;
+  overrideState.brightness = percent;
+  if (diff >= kOverrideAnalogMinDelta && overrideState.enabled) {
+    overridePublishHint = true;
+  }
+}
+
+void initOverrideHardware() {
+  pinMode(OVERRIDE_BUTTON_PIN, OVERRIDE_BUTTON_PIN_MODE);
+  overrideState.buttonStable = overrideButtonPressedLevel(digitalRead(OVERRIDE_BUTTON_PIN));
+  overrideState.buttonReading = overrideState.buttonStable;
+  overrideState.buttonLastChangeMs = millis();
+  overrideState.lastAnalogRaw = analogRead(OVERRIDE_POT_PIN);
+  overrideState.brightness = analogToPercent(overrideState.lastAnalogRaw);
+  logOverrideState();
+}
+
+void pumpOverrideInputs(unsigned long now) {
+  pollOverrideButton(now);
+  pollOverrideAnalog();
 }
 
 bool decodeScheduleJson(const String &json, RoomSchedule &out) {
@@ -533,77 +680,152 @@ void maybeRefreshSchedule(unsigned long now) {
   }
 }
 
+uint32_t wrapSubtract(uint32_t value, uint32_t delta) {
+  if (kSecondsPerDay == 0) {
+    return value;
+  }
+  delta %= kSecondsPerDay;
+  if (delta > value) {
+    return kSecondsPerDay - (delta - value);
+  }
+  return value - delta;
+}
+
+bool inWindow(uint32_t start, uint32_t end, uint32_t value) {
+  if (start == end) {
+    return false;
+  }
+  if (start < end) {
+    return value >= start && value < end;
+  }
+  return value >= start || value < end;
+}
+
+uint32_t elapsedSince(uint32_t start, uint32_t value) {
+  if (value >= start) {
+    return value - start;
+  }
+  return kSecondsPerDay - start + value;
+}
+
+uint8_t lerpBrightness(uint8_t from, uint8_t to, uint32_t elapsed, uint32_t duration) {
+  if (duration == 0) {
+    return to;
+  }
+  if (elapsed > duration) {
+    elapsed = duration;
+  }
+  int16_t delta = static_cast<int16_t>(to) - static_cast<int16_t>(from);
+  int32_t scaled = static_cast<int32_t>(delta) * static_cast<int32_t>(elapsed) +
+                   static_cast<int32_t>(duration / 2);
+  int32_t result = static_cast<int32_t>(from) + scaled / static_cast<int32_t>(duration);
+  if (result < 0) {
+    result = 0;
+  } else if (result > 100) {
+    result = 100;
+  }
+  return static_cast<uint8_t>(result);
+}
+
 uint8_t evaluateScheduleBrightness(const tm &now) {
   uint32_t seconds =
       static_cast<uint32_t>(now.tm_hour) * 3600UL + static_cast<uint32_t>(now.tm_min) * 60UL +
       static_cast<uint32_t>(now.tm_sec);
   uint8_t brightness = scheduleCfg.baselineBrightness;
+  uint8_t dayBrightness = brightness;
 
   if (scheduleCfg.wakeEnabled) {
-    uint32_t sunriseStart = static_cast<uint32_t>(scheduleCfg.wakeStartMin) * 60UL;
-    uint32_t sunriseDuration = static_cast<uint32_t>(scheduleCfg.wakeDurationMin) * 60UL;
+    uint32_t sunriseTarget = static_cast<uint32_t>(scheduleCfg.wakeStartMin) * 60UL;
+    uint16_t leadMinutes =
+        scheduleCfg.wakeDurationMin > 0 ? scheduleCfg.wakeDurationMin : kWakeLeadMinutes;
+    if (leadMinutes < kWakeLeadMinutes) {
+      leadMinutes = kWakeLeadMinutes;
+    }
+    uint32_t sunriseDuration = static_cast<uint32_t>(leadMinutes) * 60UL;
+    uint32_t sunriseStart = wrapSubtract(sunriseTarget, sunriseDuration);
     if (sunriseDuration == 0) {
-      if (seconds >= sunriseStart) {
+      if (seconds >= sunriseTarget) {
         brightness = scheduleCfg.wakePeakBrightness;
       }
-    } else if (seconds >= sunriseStart && seconds < sunriseStart + sunriseDuration) {
-      uint32_t elapsed = seconds - sunriseStart;
-      uint32_t scaled = static_cast<uint32_t>(scheduleCfg.wakePeakBrightness) * elapsed +
-                        (sunriseDuration / 2);
-      uint8_t ramp = static_cast<uint8_t>(scaled / sunriseDuration);
-      if (ramp < scheduleCfg.baselineBrightness) {
-        ramp = scheduleCfg.baselineBrightness;
+    } else {
+      bool rampActive = inWindow(sunriseStart, sunriseTarget, seconds);
+      if (rampActive) {
+        uint32_t elapsed = elapsedSince(sunriseStart, seconds);
+        uint32_t scaled = static_cast<uint32_t>(scheduleCfg.wakePeakBrightness) * elapsed +
+                          (sunriseDuration / 2);
+        uint8_t ramp = static_cast<uint8_t>(scaled / sunriseDuration);
+        if (ramp < scheduleCfg.baselineBrightness) {
+          ramp = scheduleCfg.baselineBrightness;
+        }
+        brightness = ramp;
+      } else if (inWindow(sunriseTarget, sunriseStart, seconds)) {
+        brightness = scheduleCfg.wakePeakBrightness;
       }
-      brightness = ramp;
-    } else if (seconds >= sunriseStart + sunriseDuration) {
-      brightness = scheduleCfg.wakePeakBrightness;
     }
   }
+  dayBrightness = brightness;
 
   if (scheduleCfg.nightEnabled) {
     uint32_t nightStart = static_cast<uint32_t>(scheduleCfg.nightStartMin) * 60UL;
     uint32_t nightEnd =
         scheduleCfg.wakeEnabled ? static_cast<uint32_t>(scheduleCfg.wakeStartMin) * 60UL : nightStart;
-    bool inNight = false;
+    uint32_t quietRampDuration = static_cast<uint32_t>(kQuietLeadMinutes) * 60UL;
+    uint32_t quietRampStart = wrapSubtract(nightStart, quietRampDuration);
+    bool inQuiet = false;
     if (nightStart == nightEnd) {
-      inNight = seconds >= nightStart;
-    } else if (nightStart < nightEnd) {
-      inNight = seconds >= nightStart && seconds < nightEnd;
+      inQuiet = seconds >= nightStart;
     } else {
-      inNight = seconds >= nightStart || seconds < nightEnd;
+      inQuiet = inWindow(nightStart, nightEnd, seconds);
     }
-    if (inNight) {
+    if (inQuiet) {
       brightness = scheduleCfg.nightBrightness;
+    } else if (quietRampDuration > 0 && inWindow(quietRampStart, nightStart, seconds)) {
+      uint32_t elapsed = elapsedSince(quietRampStart, seconds);
+      brightness =
+          lerpBrightness(dayBrightness, scheduleCfg.nightBrightness, elapsed, quietRampDuration);
     }
   }
   return clampPercent(brightness);
 }
 
 void maybePublishScheduledState(unsigned long now) {
-  if ((now - lastSchedulePublishMs) < kSchedulePublishIntervalMs) {
+  bool urgent = overridePublishHint;
+  if (!urgent && (now - lastSchedulePublishMs) < kSchedulePublishIntervalMs) {
     return;
   }
-  lastSchedulePublishMs = now;
-  if (!roomId.length() || !redis.connected() || !scheduleLoaded) {
+  if (!roomId.length() || !redis.connected()) {
+    return;
+  }
+  if (!scheduleLoaded && !overrideState.enabled) {
     return;
   }
   tm localNow;
-  if (!acquireLocalTime(localNow)) {
+  bool haveTime = acquireLocalTime(localNow);
+  if (!overrideState.enabled && !haveTime) {
     return;
   }
   if (needsVersionSeed && !seedVersionFromRedis()) {
     return;
   }
   contracts::Desired desired = lastDesired;
-  desired.brightness = evaluateScheduleBrightness(localNow);
+  if (overrideState.enabled) {
+    desired.brightness = overrideState.brightness;
+  } else {
+    desired.brightness = evaluateScheduleBrightness(localNow);
+  }
   const char *mode = desired.brightness > 0 ? "on" : "off";
   if (!contracts::copyMode(mode, desired)) {
     return;
   }
   if (contracts::sameDesired(desired, lastDesired)) {
+    overridePublishHint = false;
+    lastSchedulePublishMs = now;
     return;
   }
-  publishDesired(desired);
+  if (publishDesired(desired)) {
+    overridePublishHint = false;
+    lastSchedulePublishMs = now;
+  }
 }
 
 }  // namespace
@@ -611,6 +833,7 @@ void maybePublishScheduledState(unsigned long now) {
 void setup() {
   consoleSerial.begin(SENDER_CONSOLE_BAUD);
   log(F("boot"));
+  initOverrideHardware();
   WiFi.mode(WIFI_STA);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
 #ifdef WIFI_HOSTNAME
@@ -627,6 +850,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
   pumpConsole();
+  pumpOverrideInputs(now);
   ensureRoomFromOverride();
   if (!ensureWifi()) {
     maybeRequestRoom(now);
