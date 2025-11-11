@@ -8,6 +8,7 @@ Two PlatformIO projects plus a shared contracts header implement a Redis-driven 
 - `contracts/` - header-only library with Redis key helpers and JSON codecs.
 - `esp-sender/` - ESP8266 D1 mini scheduler that pulls Redis config, computes desired states, and writes Redis keys/streams.
 - `esp-receiver/` - ESP8266 D1 mini that provisions a room id, applies LED PWM, heartbeats, and acks.
+- `website/` - lightweight Node.js UI + API for editing quiet hours and toggling manual override per room.
 - `docker/docker-compose.yml` - Redis 7 with AOF enabled for local testing.
 
 ## Quick Start
@@ -27,6 +28,18 @@ pio run -e esp_sender -t upload
 pio run -e esp_receiver -t upload
 ```
    Open a serial monitor at `115200` when needed (e.g. `pio device monitor -e esp_receiver -b 115200`). You can still run inside a subdirectory with `-d` if you prefer that workflow.
+
+### Website
+
+```bash
+cd website
+npm start
+```
+
+Navigate to `http://localhost:3000/` and enter a room id (for example, `101`). Each room page (`/room/{id}`) offers:
+
+- Quiet hours form – wires the sleep/wake times into `room:{id}:cfg`.
+- Manual override controls – mirrors the control-panel button by writing `room:{id}:override`.
 
 ## Wiring Overview
 

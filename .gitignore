@@ -4,3 +4,5 @@
 .vscode/launch.json
 .vscode/ipch
 docs/
+website/node_modules
+website/.env

@@ -1,0 +1,9 @@
+{
+  "name": "hospital-lighting-website",
+  "version": "1.0.0",
+  "description": "Minimal per-room web UI for quiet hours and override controls.",
+  "license": "MIT",
+  "scripts": {
+    "start": "node src/server.js"
+  }
+}

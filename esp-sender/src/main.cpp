@@ -130,6 +130,7 @@ constexpr uint16_t kOverrideAnalogMin = OVERRIDE_ANALOG_MIN;
 constexpr uint16_t kOverrideAnalogMax = OVERRIDE_ANALOG_MAX;
 constexpr uint8_t kOverrideAnalogMinDelta = OVERRIDE_ANALOG_MIN_DELTA;
 constexpr unsigned long kOverrideButtonDebounceMs = OVERRIDE_BUTTON_DEBOUNCE_MS;
+constexpr unsigned long kOverrideRefreshIntervalMs = 2000;
 
 HardwareSerial &consoleSerial = Serial;
 HardwareSerial &logSerial = Serial;
@@ -161,6 +162,7 @@ String roomId;
 bool needsVersionSeed = true;
 uint32_t localVer = 0;
 String jsonScratch;
+String overrideJsonScratch;
 contracts::Desired lastDesired;
 bool overridePublishHint = false;
 
@@ -174,6 +176,16 @@ struct OverrideState {
 };
 
 OverrideState overrideState;
+
+struct OverrideMirror {
+  bool known = false;
+  bool enabled = false;
+  uint32_t version = 0;
+};
+
+OverrideMirror overrideMirror;
+bool overrideDirty = false;
+unsigned long lastOverrideFetchMs = 0;
 
 struct RoomSchedule {
   bool wakeEnabled = true;
@@ -220,6 +232,9 @@ void resetState() {
   scheduleLoaded = false;
   lastScheduleFetchMs = 0;
   lastSchedulePublishMs = 0;
+  overrideMirror = OverrideMirror();
+  overrideDirty = false;
+  lastOverrideFetchMs = 0;
 }
 
 void dropRedis(const __FlashStringHelper *context) {
@@ -354,16 +369,19 @@ uint8_t analogToPercent(uint16_t raw) {
   return static_cast<uint8_t>(scaled / span);
 }
 
-void setOverrideEnabled(bool enabled) {
+void setOverrideEnabled(bool enabled, bool syncToRedis = true) {
   if (overrideState.enabled == enabled) {
     return;
   }
   overrideState.enabled = enabled;
+  if (syncToRedis) {
+    overrideDirty = true;
+  }
   overridePublishHint = true;
   logOverrideState();
 }
 
-void toggleOverride() { setOverrideEnabled(!overrideState.enabled); }
+void toggleOverride() { setOverrideEnabled(!overrideState.enabled, true); }
 
 void pollOverrideButton(unsigned long now) {
   bool pressed = overrideButtonPressedLevel(digitalRead(OVERRIDE_BUTTON_PIN));
@@ -412,6 +430,106 @@ void initOverrideHardware() {
 void pumpOverrideInputs(unsigned long now) {
   pollOverrideButton(now);
   pollOverrideAnalog();
+}
+
+bool decodeOverrideJson(const String &json, bool &enabled, uint32_t &version) {
+  if (!json.length()) {
+    return false;
+  }
+  StaticJsonDocument<160> doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    return false;
+  }
+  JsonVariant enabledField = doc["enabled"];
+  if (enabledField.isNull()) {
+    return false;
+  }
+  enabled = enabledField.as<bool>();
+  if (!doc["ver"].isNull()) {
+    version = doc["ver"].as<uint32_t>();
+  } else if (!doc["version"].isNull()) {
+    version = doc["version"].as<uint32_t>();
+  } else {
+    version = 0;
+  }
+  return true;
+}
+
+uint32_t overrideTimestamp() {
+  if (timeIsValid()) {
+    time_t now = time(nullptr);
+    if (now >= 0) {
+      return static_cast<uint32_t>(now);
+    }
+  }
+  return static_cast<uint32_t>(millis());
+}
+
+void maybeFetchOverrideState(unsigned long now) {
+  if (!roomId.length() || !redis.connected()) {
+    return;
+  }
+  if ((now - lastOverrideFetchMs) < kOverrideRefreshIntervalMs) {
+    return;
+  }
+  bool isNull = false;
+  String payload;
+  if (!redis.get(contracts::key_override(roomId), payload, &isNull)) {
+    dropRedis(F("override get"));
+    return;
+  }
+  lastOverrideFetchMs = now;
+  if (isNull || !payload.length()) {
+    return;
+  }
+  bool enabled = false;
+  uint32_t version = 0;
+  if (!decodeOverrideJson(payload, enabled, version)) {
+    logSerial.println(F("[override] ignored invalid payload"));
+    return;
+  }
+  if (!overrideMirror.known || version > overrideMirror.version) {
+    overrideMirror.known = true;
+    overrideMirror.version = version;
+    overrideMirror.enabled = enabled;
+    setOverrideEnabled(enabled, false);
+    logSerial.print(F("[override] remote -> "));
+    logSerial.print(enabled ? F("enabled") : F("disabled"));
+    logSerial.print(F(" v="));
+    logSerial.println(version);
+  }
+}
+
+void maybePublishOverrideState() {
+  if (!overrideDirty || !roomId.length() || !redis.connected()) {
+    return;
+  }
+  StaticJsonDocument<192> doc;
+  doc["enabled"] = overrideState.enabled;
+  uint32_t newVer = overrideMirror.known ? (overrideMirror.version + 1) : 1;
+  doc["ver"] = newVer;
+  doc["updated_at"] = overrideTimestamp();
+  doc["source"] = "device";
+  overrideJsonScratch.remove(0);
+  size_t docSize = measureJson(doc);
+  overrideJsonScratch.reserve(docSize + 8);
+  if (serializeJson(doc, overrideJsonScratch) == 0) {
+    logSerial.println(F("[override] failed to encode json"));
+    return;
+  }
+  if (!redis.set(contracts::key_override(roomId), overrideJsonScratch)) {
+    dropRedis(F("set override"));
+    return;
+  }
+  overrideMirror.known = true;
+  overrideMirror.version = newVer;
+  overrideMirror.enabled = overrideState.enabled;
+  overrideDirty = false;
+  logSerial.print(F("[override] stored "));
+  logSerial.print(overrideState.enabled ? F("enabled") : F("disabled"));
+  logSerial.print(F(" v="));
+  logSerial.println(newVer);
 }
 
 bool decodeScheduleJson(const String &json, RoomSchedule &out) {
@@ -844,6 +962,7 @@ void setup() {
 #endif
   randomSeed(ESP.getChipId());
   jsonScratch.reserve(192);
+  overrideJsonScratch.reserve(128);
   ensureRoomFromOverride();
 }
 
@@ -866,6 +985,8 @@ void loop() {
   ensureRoomFromOverride();
   ensureClockSync(now);
   maybeRefreshSchedule(now);
+  maybeFetchOverrideState(now);
+  maybePublishOverrideState();
   maybePublishScheduledState(now);
   maybeRequestRoom(now);
   yield();
