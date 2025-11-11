@@ -49,6 +49,8 @@ uint32_t lastAppliedVer = 0;
 unsigned long lastHeartbeatMs = 0;
 unsigned long lastAnnounceMs = 0;
 String jsonScratch;
+bool wifiAnnounced = false;
+unsigned long lastWifiStatusLogMs = 0;
 
 const char kProvisionScript[] PROGMEM = R"lua(
 local dev = ARGV[1]
@@ -97,17 +99,45 @@ void dropRedis(const __FlashStringHelper *context) {
   resetRoomState();
 }
 
+void logWifiSnapshot(const __FlashStringHelper *prefix) {
+  Serial.print(F("[wifi] "));
+  if (prefix) {
+    Serial.print(prefix);
+    Serial.print(' ');
+  }
+  wl_status_t status = WiFi.status();
+  Serial.print(F("status="));
+  Serial.print(static_cast<int>(status));
+  Serial.print(F(" ip="));
+  Serial.print(WiFi.localIP());
+  Serial.print(F(" gw="));
+  Serial.print(WiFi.gatewayIP());
+  Serial.print(F(" rssi="));
+  Serial.println(WiFi.RSSI());
+}
+
 bool ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiBackoff.reset();
+    if (!wifiAnnounced) {
+      logWifiSnapshot(F("connected"));
+      wifiAnnounced = true;
+    }
     return true;
   }
+  wifiAnnounced = false;
   unsigned long now = millis();
   if (!wifiBackoff.ready(now)) {
+    if ((now - lastWifiStatusLogMs) > 1000) {
+      logWifiSnapshot(F("waiting"));
+      lastWifiStatusLogMs = now;
+    }
     return false;
   }
   WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASS);
+  logWifiSnapshot(F("begin"));
+  lastWifiStatusLogMs = now;
   wifiBackoff.schedule(now);
   return false;
 }
