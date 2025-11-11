@@ -6,6 +6,10 @@
 #include "contracts.hpp"
 #include "redis_link.hpp"
 
+#ifndef PWMRANGE
+#define PWMRANGE 1023
+#endif
+
 namespace {
 
 constexpr uint8_t kLedPin = D4;

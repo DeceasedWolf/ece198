@@ -8,6 +8,10 @@
 #include "contracts.hpp"
 #include "redis_link.hpp"
 
+#ifndef PWMRANGE
+#define PWMRANGE 1023
+#endif
+
 #ifndef SENDER_CONSOLE_BAUD
 #define SENDER_CONSOLE_BAUD 115200
 #endif
