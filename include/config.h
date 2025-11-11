@@ -6,12 +6,12 @@
  */
 
 // Wi-Fi credentials for every ESP8266 in the system.
-#define WIFI_SSID "ChangeMe"
-#define WIFI_PASS "ChangeMeToo"
+#define WIFI_SSID "projecttest"
+#define WIFI_PASS "12345678"
 #define WIFI_HOSTNAME "hospital-light-node"
 
 // Redis broker configuration.
-#define REDIS_HOST "192.168.1.50"
+#define REDIS_HOST "192.168.2.1"
 #define REDIS_PORT 6379
 #define REDIS_PASSWORD ""
 
