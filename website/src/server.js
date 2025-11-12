@@ -10,6 +10,7 @@ const appConfig = {
   redisPort: Number(process.env.REDIS_PORT || 6379),
   redisPassword: process.env.REDIS_PASSWORD || ''
 };
+const STREAM_TRIM_LENGTH = 200;
 
 class RedisClient {
   constructor(options) {
@@ -247,6 +248,11 @@ const DEFAULT_SCHEDULE = Object.freeze({
   night: { enabled: true, hour: 22, minute: 0, brightness: 5 },
   version: 0
 });
+const DEFAULT_DESIRED_STATE = Object.freeze({
+  mode: 'off',
+  brightness: 0,
+  ver: 0
+});
 
 function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -308,6 +314,36 @@ function parseTimeInput(value) {
   return { hour, minute };
 }
 
+function clampBrightness(value) {
+  const num = Number(value);
+  if (Number.isNaN(num) || num <= 0) {
+    return 0;
+  }
+  if (num >= 100) {
+    return 100;
+  }
+  return Math.round(num);
+}
+
+function readDesiredPayload(payload) {
+  if (!payload) {
+    return deepClone(DEFAULT_DESIRED_STATE);
+  }
+  try {
+    const parsed = JSON.parse(payload);
+    if (typeof parsed !== 'object' || parsed === null) {
+      return deepClone(DEFAULT_DESIRED_STATE);
+    }
+    const mode = parsed.mode === 'on' ? 'on' : 'off';
+    const brightness = clampBrightness(parsed.brightness);
+    const ver = Number.isInteger(parsed.ver) ? parsed.ver : 0;
+    return { mode, brightness, ver };
+  } catch (err) {
+    console.warn('[website] invalid desired JSON, resetting to defaults');
+    return deepClone(DEFAULT_DESIRED_STATE);
+  }
+}
+
 function quietTimesFromSchedule(schedule) {
   const sleep = formatTime(schedule.night.hour, schedule.night.minute);
   const wake = formatTime(schedule.wake.hour, schedule.wake.minute);
@@ -335,6 +371,14 @@ function roomConfigKey(roomId) {
 
 function roomOverrideKey(roomId) {
   return `room:${roomId}:override`;
+}
+
+function roomDesiredKey(roomId) {
+  return `room:${roomId}:desired`;
+}
+
+function roomCommandStream(roomId) {
+  return `cmd:room:${roomId}`;
 }
 
 async function getOverrideState(roomId) {
@@ -366,6 +410,33 @@ async function setOverrideState(roomId, enabled, source = 'website') {
   };
   await redis.set(roomOverrideKey(roomId), JSON.stringify(next));
   return next;
+}
+
+async function sendBrightnessCommand(roomId, brightness, source = 'website') {
+  const clamped = clampBrightness(brightness);
+  const desiredKey = roomDesiredKey(roomId);
+  const payload = await redis.get(desiredKey);
+  const current = readDesiredPayload(payload);
+  const ver = Number.isInteger(current.ver) ? current.ver + 1 : 1;
+  const desired = {
+    room: roomId,
+    mode: clamped > 0 ? 'on' : 'off',
+    brightness: clamped,
+    ver,
+    source
+  };
+  const serialized = JSON.stringify(desired);
+  await redis.set(desiredKey, serialized);
+  const streamKey = roomCommandStream(roomId);
+  await redis.sendCommand(['XADD', streamKey, '*', 'p', serialized]);
+  await redis.sendCommand([
+    'XTRIM',
+    streamKey,
+    'MAXLEN',
+    '~',
+    String(STREAM_TRIM_LENGTH)
+  ]);
+  return desired;
 }
 
 async function loadRoomState(roomId) {
@@ -411,6 +482,10 @@ function renderStatusMessage(code) {
       return 'Override enabled.';
     case 'override-disabled':
       return 'Override disabled.';
+    case 'brightness-max':
+      return 'Requested full brightness.';
+    case 'brightness-min':
+      return 'Requested minimum brightness.';
     default:
       return null;
   }
@@ -440,6 +515,8 @@ function renderRoomPage(roomId, state, statusCode) {
     button.secondary { background: #e5e7eb; color: #111827; }
     .status { padding: 0.75rem 1rem; border-radius: 0.375rem; background: #ecfccb; color: #3f6212; margin-bottom: 1rem; font-weight: 600; }
     .override-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .quick-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .quick-actions form { flex-direction: row; gap: 0; }
   </style>
 </head>
 <body>
@@ -474,6 +551,20 @@ function renderRoomPage(roomId, state, statusCode) {
       </form>
     </div>
   </section>
+  <section>
+    <h2>Instant Brightness</h2>
+    <p>Send an immediate brightness command to the room light.</p>
+    <div class="quick-actions">
+      <form method="POST" action="/room/${encodeURIComponent(roomId)}/brightness">
+        <input type="hidden" name="level" value="max">
+        <button type="submit" class="primary">Full Brightness</button>
+      </form>
+      <form method="POST" action="/room/${encodeURIComponent(roomId)}/brightness">
+        <input type="hidden" name="level" value="min">
+        <button type="submit" class="secondary">Lights Out</button>
+      </form>
+    </div>
+  </section>
 </body>
 </html>`;
 }
@@ -505,7 +596,7 @@ function renderIndexPage() {
 }
 
 function matchRoomRoute(pathname) {
-  const match = pathname.match(/^\/room\/([^/]+)(?:\/(quiet-hours|override))?\/?$/);
+  const match = pathname.match(/^\/room\/([^/]+)(?:\/(quiet-hours|override|brightness))?\/?$/);
   if (!match) {
     return null;
   }
@@ -598,6 +689,28 @@ async function handleRequest(req, res) {
       const enabled = enabledParam === 'true';
       await setOverrideState(roomId, enabled, 'website');
       const statusCode = enabled ? 'override-enabled' : 'override-disabled';
+      res.writeHead(303, { Location: `/room/${encodeURIComponent(roomId)}?status=${statusCode}` });
+      res.end();
+      return;
+    }
+    if (req.method === 'POST' && action === 'brightness') {
+      const body = await readRequestBody(req);
+      const params = new URLSearchParams(body);
+      const level = params.get('level');
+      let brightnessTarget;
+      let statusCode;
+      if (level === 'max') {
+        brightnessTarget = 100;
+        statusCode = 'brightness-max';
+      } else if (level === 'min') {
+        brightnessTarget = 0;
+        statusCode = 'brightness-min';
+      } else {
+        res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Unknown brightness level');
+        return;
+      }
+      await sendBrightnessCommand(roomId, brightnessTarget, 'website');
       res.writeHead(303, { Location: `/room/${encodeURIComponent(roomId)}?status=${statusCode}` });
       res.end();
       return;
