@@ -168,22 +168,27 @@ bool ensureRedis() {
   }
   redis.stop();
   redisClient.stop();
+  Serial.printf("[redis] connect %s:%u\n", REDIS_HOST, static_cast<unsigned>(REDIS_PORT));
   if (!redisClient.connect(REDIS_HOST, REDIS_PORT)) {
+    Serial.println("[redis] tcp connect failed");
     redisBackoff.schedule(now);
     return false;
   }
   redis.setTimeout(kRedisTimeoutMs);
   redisClient.setNoDelay(true);
   if (!redis.auth(REDIS_PASSWORD)) {
+    Serial.println("[redis] auth failed");
     redisBackoff.schedule(now);
     dropRedis(F("auth"));
     return false;
   }
   if (!redis.ping()) {
+    Serial.println("[redis] ping failed");
     redisBackoff.schedule(now);
     dropRedis(F("ping"));
     return false;
   }
+  Serial.println("[redis] connected");
   redisBackoff.reset();
   resetRoomState();
   return true;
@@ -207,10 +212,14 @@ bool provisionRoom() {
     return false;
   }
   String rid;
+  Serial.println("[redis] provisioning room");
   if (!redis.evalRoomScript(FPSTR(kProvisionScript), deviceId, PROVISIONING_BASE_ID, rid)) {
+    Serial.println("[redis] provision failed");
     dropRedis(F("provision"));
     return false;
   }
+  Serial.print("[redis] provisioned room ");
+  Serial.println(rid);
   if (!rid.length()) {
     return false;
   }
