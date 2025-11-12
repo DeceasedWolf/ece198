@@ -59,7 +59,7 @@
 #define OVERRIDE_ANALOG_MIN_DELTA 2
 
 // Timekeeping (seconds relative to UTC). Adjust for deployment timezone/DST.
-#define TZ_OFFSET_SECONDS 0
+#define TZ_OFFSET_SECONDS (-5 * 3600)
 #define DST_OFFSET_SECONDS 0
 #define NTP_SERVER_PRIMARY "pool.ntp.org"
 #define NTP_SERVER_SECONDARY "time.nist.gov"
