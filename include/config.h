@@ -11,7 +11,7 @@
 #define WIFI_HOSTNAME "hospital-light-node"
 
 // Redis broker configuration.
-#define REDIS_HOST "192.168.2.1"
+#define REDIS_HOST "192.168.137.46"
 #define REDIS_PORT 6379
 #define REDIS_PASSWORD ""
 
