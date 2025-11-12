@@ -75,7 +75,11 @@ class RedisLink {
     return sendIntegerConsume({RedisArg("XTRIM"), RedisArg(stream), RedisArg("MAXLEN"), RedisArg("~"), RedisArg(lenStr)});
   }
 
-  bool xreadLatest(const String &stream, uint16_t blockMs, String &payload) {
+  bool xreadLatest(const String &stream,
+                   uint16_t blockMs,
+                   const String &sinceId,
+                   String &entryId,
+                   String &payload) {
     char block[8];
     snprintf(block, sizeof(block), "%u", blockMs);
     if (!sendCommand({RedisArg("XREAD"),
@@ -85,10 +89,11 @@ class RedisLink {
                       RedisArg("1"),
                       RedisArg("STREAMS"),
                       RedisArg(stream),
-                      RedisArg("$")})) {
+                      RedisArg(sinceId)})) {
       return false;
     }
-    return readXreadPayload(payload);
+    entryId.remove(0);
+    return readXreadPayload(entryId, payload);
   }
 
   bool setHeartbeat(const String &key, uint16_t ttlSec) {
@@ -313,7 +318,7 @@ class RedisLink {
     return got == sizeof(buf) && buf[0] == '\r' && buf[1] == '\n';
   }
 
-  bool readXreadPayload(String &payload) {
+  bool readXreadPayload(String &entryIdOut, String &payload) {
     int topCount = 0;
     if (!readArrayLen(topCount)) {
       // Null reply => timeout, nothing to do.
@@ -359,6 +364,7 @@ class RedisLink {
           }
           if (fieldName == "p") {
             payload = fieldValue;
+            entryIdOut = entryId;
             return true;
           }
         }

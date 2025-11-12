@@ -47,7 +47,8 @@ Navigate to `http://localhost:3000/` and enter a room id (for example, `101`). E
   - Power the D1 mini (or similar ESP8266) from USB or a regulated 3.3 V rail and keep the USB/UART console accessible at `SENDER_CONSOLE_BAUD` so you can answer the `ROOM?` prompt (or just set `ROOM_ID_OVERRIDE`).
   - No external Arduino panel is required; the sender calculates brightness locally from the Redis schedule and current time.
 - **Receiver LED output**
-  - ESP8266 `D4` drives LED PWM. For anything beyond a small indicator LED, use a MOSFET/transistor and a dedicated LED supply rail (include a flyback diode if inductive).
+  - `RECEIVER_LED_PIN` (default `D4`) defines which GPIO drives PWM. For anything beyond a small indicator LED, use a MOSFET/transistor and a dedicated LED supply rail (include a flyback diode if inductive).
+  - Set `RECEIVER_LED_ACTIVE_LOW` in `include/config.h` if your LED (including the onboard D4 LED) turns on when the pin is driven low.
 - **Networking**
   - Both ESP8266 boards operate in STA mode on the same 2.4GHz SSID. Keep them on an isolated lab VLAN when possible.
 

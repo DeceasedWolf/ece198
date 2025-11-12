@@ -25,6 +25,10 @@
 // Heartbeat interval for the receiver (must be < kHeartbeatTtlSec from contracts.hpp).
 #define RECEIVER_HEARTBEAT_MS 3000
 
+// Receiver LED pin/polarity (set ACTIVE_LOW when the LED turns on if the pin is driven low).
+#define RECEIVER_LED_PIN D4
+#define RECEIVER_LED_ACTIVE_LOW 0
+
 // ESP sender console + scheduling defaults.
 #define SENDER_CONSOLE_BAUD 115200
 #define SCHEDULE_REFRESH_MS 30000
