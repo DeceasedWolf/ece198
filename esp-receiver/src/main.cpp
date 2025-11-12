@@ -50,7 +50,6 @@ unsigned long lastHeartbeatMs = 0;
 unsigned long lastAnnounceMs = 0;
 String jsonScratch;
 bool wifiAnnounced = false;
-unsigned long lastWifiStatusLogMs = 0;
 
 const char kProvisionScript[] PROGMEM = R"lua(
 local dev = ARGV[1]
@@ -116,6 +115,29 @@ void logWifiSnapshot(const __FlashStringHelper *prefix) {
   Serial.println(WiFi.RSSI());
 }
 
+void connectWifiBlocking() {
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  delay(500);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print(F("[wifi] blocking connect to "));
+  Serial.println(F(WIFI_SSID));
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(F("[wifi] status="));
+    Serial.println(static_cast<int>(WiFi.status()));
+    delay(500);
+    if (millis() - start > 20000) {
+      Serial.println(F("[wifi] retrying blocking connect"));
+      WiFi.disconnect(false);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      start = millis();
+    }
+  }
+  logWifiSnapshot(F("connected (blocking)"));
+}
+
 bool ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiBackoff.reset();
@@ -126,20 +148,10 @@ bool ensureWifi() {
     return true;
   }
   wifiAnnounced = false;
-  unsigned long now = millis();
-  if (!wifiBackoff.ready(now)) {
-    if ((now - lastWifiStatusLogMs) > 1000) {
-      logWifiSnapshot(F("waiting"));
-      lastWifiStatusLogMs = now;
-    }
-    return false;
-  }
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  logWifiSnapshot(F("begin"));
-  lastWifiStatusLogMs = now;
-  wifiBackoff.schedule(now);
-  return false;
+  connectWifiBlocking();
+  wifiBackoff.reset();
+  wifiAnnounced = true;
+  return true;
 }
 
 bool ensureRedis() {
@@ -311,8 +323,9 @@ void setup() {
   analogWrite(kLedPin, 0);
   WiFi.mode(WIFI_STA);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.persistent(false);
   WiFi.disconnect(true);
-  delay(100);
+  delay(200);
 #ifdef WIFI_HOSTNAME
   WiFi.hostname(WIFI_HOSTNAME);
 #endif
