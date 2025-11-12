@@ -311,6 +311,8 @@ void setup() {
   analogWrite(kLedPin, 0);
   WiFi.mode(WIFI_STA);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.disconnect(true);
+  delay(100);
 #ifdef WIFI_HOSTNAME
   WiFi.hostname(WIFI_HOSTNAME);
 #endif

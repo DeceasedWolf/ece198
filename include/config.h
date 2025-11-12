@@ -6,7 +6,7 @@
  */
 
 // Wi-Fi credentials for every ESP8266 in the system.
-#define WIFI_SSID "projecttest"
+#define WIFI_SSID "Mathis"
 #define WIFI_PASS "12345678"
 #define WIFI_HOSTNAME "hospital-light-node"
 
