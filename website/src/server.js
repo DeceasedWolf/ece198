@@ -574,7 +574,7 @@ function renderRoomPage(roomId, state, statusCode) {
     </div>
   </section>
   <section id="brightness">
-    <h2>Instant Brightness</h2>
+    <h2>Instant Brightness (For Testing Purposes)</h2>
     <p>Send an immediate brightness command to the room light.</p>
     <div class="quick-actions">
       <form method="POST" action="/room/${encodeURIComponent(roomId)}/brightness">
