@@ -328,8 +328,8 @@ void handleRoomAnnouncement(const char *payload) {
     logSerial.print(F("[sender] room -> "));
     logSerial.println(rid);
     roomId = rid;
+    resetState();
   }
-  resetState();
 }
 
 uint8_t clampPercent(int value) {
@@ -878,16 +878,21 @@ uint8_t evaluateScheduleBrightness(const tm &now) {
       static_cast<uint32_t>(now.tm_sec);
   uint8_t brightness = scheduleCfg.baselineBrightness;
   uint8_t dayBrightness = brightness;
+  uint32_t sunriseTarget = 0;
+  uint32_t sunriseStart = 0;
+  uint32_t sunriseDuration = 0;
+  bool sunriseHasRamp = false;
 
   if (scheduleCfg.wakeEnabled) {
-    uint32_t sunriseTarget = static_cast<uint32_t>(scheduleCfg.wakeStartMin) * 60UL;
+    sunriseTarget = static_cast<uint32_t>(scheduleCfg.wakeStartMin) * 60UL;
     uint16_t leadMinutes =
         scheduleCfg.wakeDurationMin > 0 ? scheduleCfg.wakeDurationMin : kWakeLeadMinutes;
     if (leadMinutes < kWakeLeadMinutes) {
       leadMinutes = kWakeLeadMinutes;
     }
-    uint32_t sunriseDuration = static_cast<uint32_t>(leadMinutes) * 60UL;
-    uint32_t sunriseStart = wrapSubtract(sunriseTarget, sunriseDuration);
+    sunriseDuration = static_cast<uint32_t>(leadMinutes) * 60UL;
+    sunriseStart = wrapSubtract(sunriseTarget, sunriseDuration);
+    sunriseHasRamp = sunriseDuration > 0;
     if (sunriseDuration == 0) {
       if (seconds >= sunriseTarget) {
         brightness = scheduleCfg.wakePeakBrightness;
@@ -912,8 +917,10 @@ uint8_t evaluateScheduleBrightness(const tm &now) {
 
   if (scheduleCfg.nightEnabled) {
     uint32_t nightStart = static_cast<uint32_t>(scheduleCfg.nightStartMin) * 60UL;
-    uint32_t nightEnd =
-        scheduleCfg.wakeEnabled ? static_cast<uint32_t>(scheduleCfg.wakeStartMin) * 60UL : nightStart;
+    uint32_t nightEnd = nightStart;
+    if (scheduleCfg.wakeEnabled) {
+      nightEnd = sunriseHasRamp ? sunriseStart : sunriseTarget;
+    }
     uint32_t quietRampDuration = static_cast<uint32_t>(kQuietLeadMinutes) * 60UL;
     uint32_t quietRampStart = wrapSubtract(nightStart, quietRampDuration);
     bool inQuiet = false;
