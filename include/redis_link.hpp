@@ -96,6 +96,18 @@ class RedisLink {
     return readXreadPayload(entryId, payload);
   }
 
+  bool streamTailId(const String &stream, String &entryId) {
+    if (!sendCommand({RedisArg("XREVRANGE"),
+                      RedisArg(stream),
+                      RedisArg("+"),
+                      RedisArg("-"),
+                      RedisArg("COUNT"),
+                      RedisArg("1")})) {
+      return false;
+    }
+    return readXrevrangeTail(entryId);
+  }
+
   bool setHeartbeat(const String &key, uint16_t ttlSec) {
     char ttl[6];
     snprintf(ttl, sizeof(ttl), "%u", ttlSec);
@@ -371,5 +383,37 @@ class RedisLink {
       }
     }
     return false;
+  }
+
+  bool readXrevrangeTail(String &entryId) {
+    int entryCount = 0;
+    if (!readArrayLen(entryCount)) {
+      return false;
+    }
+    if (entryCount <= 0) {
+      entryId.remove(0);
+      return true;
+    }
+    for (int i = 0; i < entryCount; ++i) {
+      int entryLen = 0;
+      if (!readArrayLen(entryLen) || entryLen < 2) {
+        return false;
+      }
+      if (!readBulkString(entryId)) {
+        return false;
+      }
+      int fieldCount = 0;
+      if (!readArrayLen(fieldCount)) {
+        return false;
+      }
+      String tmp;
+      for (int field = 0; field < fieldCount; ++field) {
+        if (!readBulkString(tmp)) {
+          return false;
+        }
+      }
+      break;
+    }
+    return true;
   }
 };

@@ -29,6 +29,10 @@
 #define RECEIVER_LED_PIN D4
 #define RECEIVER_LED_ACTIVE_LOW 0
 
+// Optional status LED (set to LED_BUILTIN to mirror the applied brightness, or -1 to disable).
+#define RECEIVER_STATUS_LED_PIN LED_BUILTIN
+#define RECEIVER_STATUS_LED_ACTIVE_LOW 1
+
 // ESP sender console + scheduling defaults.
 #define SENDER_CONSOLE_BAUD 115200
 #define SCHEDULE_REFRESH_MS 30000

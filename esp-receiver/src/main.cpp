@@ -22,8 +22,20 @@ constexpr uint16_t kRedisTimeoutMs = 1500;
 #ifndef RECEIVER_LED_ACTIVE_LOW
 #define RECEIVER_LED_ACTIVE_LOW 0
 #endif
+#ifndef RECEIVER_STATUS_LED_PIN
+#define RECEIVER_STATUS_LED_PIN LED_BUILTIN
+#endif
+#ifndef RECEIVER_STATUS_LED_ACTIVE_LOW
+#define RECEIVER_STATUS_LED_ACTIVE_LOW 1
+#endif
 
 constexpr uint8_t kLedPin = RECEIVER_LED_PIN;
+constexpr bool kLedActiveLow = RECEIVER_LED_ACTIVE_LOW;
+constexpr int8_t kStatusLedPin = RECEIVER_STATUS_LED_PIN;
+constexpr bool kStatusLedActiveLow = RECEIVER_STATUS_LED_ACTIVE_LOW;
+constexpr bool kStatusLedEnabled = (RECEIVER_STATUS_LED_PIN >= 0);
+constexpr bool kStatusLedSharesDriver = kStatusLedEnabled && (RECEIVER_STATUS_LED_PIN == RECEIVER_LED_PIN);
+constexpr bool kStatusLedShouldMirror = kStatusLedEnabled && !kStatusLedSharesDriver;
 
 struct Backoff {
   unsigned long nextMs = 0;
@@ -54,70 +66,55 @@ String deviceId;
 contracts::Desired lastDesired;
 bool hasDesired = false;
 uint32_t lastAppliedVer = 0;
-String lastStreamId("0-0");
+String lastStreamId;
+bool streamCursorValid = false;
 unsigned long lastHeartbeatMs = 0;
 unsigned long lastAnnounceMs = 0;
 String jsonScratch;
 bool wifiAnnounced = false;
 
-bool replaceUtf8Quotes(String &text) {
-  bool modified = false;
-  String normalized;
-  normalized.reserve(text.length());
-  for (size_t i = 0; i < text.length(); ++i) {
-    uint8_t b0 = static_cast<uint8_t>(text[i]);
-    if (b0 == 0xE2 && (i + 2) < text.length()) {
-      uint8_t b1 = static_cast<uint8_t>(text[i + 1]);
-      uint8_t b2 = static_cast<uint8_t>(text[i + 2]);
-      if (b1 == 0x80 && (b2 == 0x9C || b2 == 0x9D || b2 == 0x98 || b2 == 0x99)) {
-        normalized += '"';
-        modified = true;
-        i += 2;
-        continue;
-      }
+bool decodeDesiredJson(const String &payload,
+                       contracts::Desired &desired,
+                       const __FlashStringHelper *context) {
+  StaticJsonDocument<contracts::kDesiredJsonCapacity> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print(F("[desired] "));
+    if (context) {
+      Serial.print(context);
+      Serial.print(' ');
     }
-    normalized += static_cast<char>(b0);
-  }
-  if (modified) {
-    text = normalized;
-  }
-  return modified;
-}
-
-bool stripWrappingQuotes(String &text) {
-  bool modified = false;
-  while (text.length() >= 2 && text[0] == '"' && text[text.length() - 1] == '"') {
-    text.remove(text.length() - 1);
-    text.remove(0, 1);
-    modified = true;
-  }
-  return modified;
-}
-
-bool isolateJsonObject(String &text) {
-  int start = text.indexOf('{');
-  int end = text.lastIndexOf('}');
-  if (start < 0 || end < 0 || end <= start) {
+    Serial.print(F("json error: "));
+    Serial.println(err.c_str());
+    Serial.print(F("[desired] payload: "));
+    Serial.println(payload);
     return false;
   }
-  if (start == 0 && end == static_cast<int>(text.length()) - 1) {
+  JsonVariantConst modeVar = doc["mode"];
+  const char *modePtr = nullptr;
+  String modeStr;
+  if (modeVar.is<const char *>()) {
+    modePtr = modeVar.as<const char *>();
+  } else if (modeVar.is<String>()) {
+    modeStr = modeVar.as<String>();
+    modePtr = modeStr.c_str();
+  }
+  if (!contracts::copyMode(modePtr, desired)) {
+    Serial.print(F("[desired] "));
+    if (context) {
+      Serial.print(context);
+      Serial.print(' ');
+    }
+    Serial.print(F("invalid mode: "));
+    Serial.println(modePtr ? modePtr : "(null)");
+    Serial.print(F("[desired] payload: "));
+    Serial.println(payload);
     return false;
   }
-  text = text.substring(start, end + 1);
+  desired.brightness = doc["brightness"] | desired.brightness;
+  contracts::clampBrightness(desired);
+  desired.ver = doc["ver"] | desired.ver;
   return true;
-}
-
-void dumpPayloadHex(const String &payload) {
-  Serial.print(F("[stream] raw bytes:"));
-  for (size_t i = 0; i < payload.length(); ++i) {
-    uint8_t b = static_cast<uint8_t>(payload[i]);
-    Serial.print(' ');
-    if (b < 16) {
-      Serial.print('0');
-    }
-    Serial.print(static_cast<unsigned>(b), HEX);
-  }
-  Serial.println();
 }
 
 const char kProvisionScript[] PROGMEM = R"lua(
@@ -151,12 +148,21 @@ void logRedisFailure(const __FlashStringHelper *where) {
   Serial.println(redis.lastError());
 }
 
+uint16_t applyPolarity(uint16_t duty, bool activeLow) {
+  return activeLow ? (PWMRANGE - duty) : duty;
+}
+
+void writeLedDuty(uint8_t pin, uint16_t duty, bool activeLow) {
+  analogWrite(pin, applyPolarity(duty, activeLow));
+}
+
 void resetRoomState(bool dropRoomId = true) {
   hasDesired = false;
   lastAppliedVer = 0;
   lastHeartbeatMs = 0;
   lastAnnounceMs = 0;
-  lastStreamId = "0-0";
+  streamCursorValid = false;
+  lastStreamId.remove(0);
   if (dropRoomId) {
     roomId.remove(0);
   }
@@ -166,6 +172,23 @@ void dropRedis(const __FlashStringHelper *context) {
   logRedisFailure(context);
   redis.stop();
   resetRoomState();
+}
+
+bool primeStreamCursor() {
+  if (!roomId.length()) {
+    return false;
+  }
+  String tailId;
+  if (!redis.streamTailId(contracts::stream_cmd(roomId), tailId)) {
+    return false;
+  }
+  if (tailId.length()) {
+    lastStreamId = tailId;
+  } else {
+    lastStreamId = F("0-0");
+  }
+  streamCursorValid = true;
+  return true;
 }
 
 void logWifiSnapshot(const __FlashStringHelper *prefix) {
@@ -306,10 +329,10 @@ void applyPwm(const contracts::Desired &desired) {
   if (strcmp(desired.mode, "on") == 0 && desired.brightness > 0) {
     duty = map(desired.brightness, 0, 100, 0, PWMRANGE);
   }
-#if RECEIVER_LED_ACTIVE_LOW
-  duty = PWMRANGE - duty;
-#endif
-  analogWrite(kLedPin, duty);
+  writeLedDuty(kLedPin, duty, kLedActiveLow);
+  if (kStatusLedShouldMirror) {
+    writeLedDuty(static_cast<uint8_t>(kStatusLedPin), duty, kStatusLedActiveLow);
+  }
   Serial.printf("[pwm] pin=%u duty=%u mode=%s brightness=%u\n",
                 static_cast<unsigned>(kLedPin),
                 static_cast<unsigned>(duty),
@@ -341,7 +364,7 @@ bool pullSnapshot() {
     stored = F("{\"mode\":\"off\",\"brightness\":0,\"ver\":0}");
   }
   contracts::Desired desired;
-  if (!contracts::decodeDesired(stored, desired)) {
+  if (!decodeDesiredJson(stored, desired, F("snapshot"))) {
     desired = contracts::Desired();
   }
   if (!contracts::encodeDesired(desired, &roomId, jsonScratch)) {
@@ -351,92 +374,46 @@ bool pullSnapshot() {
   lastDesired = desired;
   lastAppliedVer = desired.ver;
   hasDesired = true;
-  return recordState(jsonScratch);
+  if (!recordState(jsonScratch)) {
+    return false;
+  }
+  streamCursorValid = false;
+  lastStreamId.remove(0);
+  return true;
 }
 
-void handlePayload(String payload) {
-  bool modified = false;
-  int originalLen = payload.length();
-  payload.trim();
-  if (payload.length() != originalLen) {
-    modified = true;
-  }
-  if (replaceUtf8Quotes(payload)) {
-    modified = true;
-  }
-  if (stripWrappingQuotes(payload)) {
-    modified = true;
-  }
-  if (isolateJsonObject(payload)) {
-    modified = true;
-  }
-  if (!payload.length()) {
-    Serial.println(F("[stream] empty payload after sanitize"));
-    return;
-  }
-  StaticJsonDocument<contracts::kDesiredJsonCapacity> doc;
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    Serial.print(F("[stream] json error: "));
-    Serial.println(err.c_str());
-    dumpPayloadHex(payload);
-    return;
-  }
-  const char *mode = nullptr;
-  if (doc["mode"].is<const char *>()) {
-    mode = doc["mode"];
-  } else if (doc["mode"].is<String>()) {
-    static String tmpMode;
-    tmpMode = doc["mode"].as<String>();
-    mode = tmpMode.c_str();
-  }
+void handlePayload(const String &payload) {
   contracts::Desired desired = lastDesired;
-  if (!contracts::copyMode(mode, desired)) {
-    Serial.print(F("[stream] invalid mode: "));
-    Serial.println(mode ? mode : "(null)");
-    Serial.print(F("[stream] doc dump: "));
-    serializeJson(doc, Serial);
-    Serial.println();
-    Serial.print(F("[stream] doc mem: "));
-    Serial.println(doc.memoryUsage());
-    dumpPayloadHex(payload);
+  if (!decodeDesiredJson(payload, desired, F("stream"))) {
     return;
   }
-  desired.brightness = doc["brightness"] | desired.brightness;
-  contracts::clampBrightness(desired);
-  desired.ver = doc["ver"] | desired.ver;
-  if (modified) {
-    Serial.print(F("[stream] sanitized payload: "));
-    Serial.println(payload);
-  }
-  if (desired.ver < lastAppliedVer) {
-    Serial.print(F("[stream] stale ver "));
-    Serial.print(desired.ver);
-    Serial.print(F(" < "));
-    Serial.println(lastAppliedVer);
+  if (desired.ver <= lastAppliedVer) {
     return;
   }
   if (!contracts::encodeDesired(desired, &roomId, jsonScratch)) {
-    Serial.println(F("[stream] encode failed"));
     return;
   }
   applyPwm(desired);
   lastDesired = desired;
   lastAppliedVer = desired.ver;
   hasDesired = true;
-  if (!recordState(jsonScratch)) {
-    Serial.println(F("[stream] record failed"));
-  }
+  recordState(jsonScratch);
 }
 
 void pumpStream() {
-  if (!roomId.length()) {
+  if (!roomId.length() || !hasDesired) {
     return;
+  }
+  if (!streamCursorValid) {
+    if (!primeStreamCursor()) {
+      dropRedis(F("stream tail"));
+      return;
+    }
   }
   String payload;
   String entryId;
-  const String sinceId = lastStreamId.length() ? lastStreamId : String("0-0");
-  if (redis.xreadLatest(contracts::stream_cmd(roomId), kXreadBlockMs, sinceId, entryId, payload)) {
+  const String cursor = lastStreamId.length() ? lastStreamId : String(F("0-0"));
+  if (redis.xreadLatest(contracts::stream_cmd(roomId), kXreadBlockMs, cursor, entryId, payload)) {
     Serial.print("[stream] id: ");
     Serial.print(entryId);
     Serial.print(" payload: ");
@@ -471,7 +448,11 @@ void setup() {
   logInfo(F("boot"));
   pinMode(kLedPin, OUTPUT);
   analogWriteRange(PWMRANGE);
-  analogWrite(kLedPin, RECEIVER_LED_ACTIVE_LOW ? PWMRANGE : 0);
+  writeLedDuty(kLedPin, 0, kLedActiveLow);
+  if (kStatusLedShouldMirror) {
+    pinMode(static_cast<uint8_t>(kStatusLedPin), OUTPUT);
+    writeLedDuty(static_cast<uint8_t>(kStatusLedPin), 0, kStatusLedActiveLow);
+  }
   WiFi.mode(WIFI_STA);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.persistent(false);
