@@ -169,6 +169,7 @@ String jsonScratch;
 String overrideJsonScratch;
 contracts::Desired lastDesired;
 bool overridePublishHint = false;
+bool desiredForcePublish = false;
 
 struct OverrideState {
   bool enabled = false;
@@ -399,6 +400,7 @@ void setOverrideEnabled(bool enabled, bool syncToRedis = true) {
     return;
   }
   overrideState.enabled = enabled;
+  desiredForcePublish = true;
   if (syncToRedis) {
     overrideDirty = true;
   }
@@ -731,24 +733,73 @@ bool seedVersionFromRedis() {
   if (!roomId.length()) {
     return false;
   }
-  bool isNull = false;
-  String snapshot;
-  if (!redis.get(contracts::key_desired(roomId), snapshot, &isNull)) {
-    dropRedis(F("seed get"));
+  auto decodeSnapshot = [](const String &payload, contracts::Desired &out) {
+    if (!payload.length()) {
+      return false;
+    }
+    StaticJsonDocument<contracts::kDesiredJsonCapacity> doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (err) {
+      return false;
+    }
+    const char *mode = doc["mode"] | nullptr;
+    if (mode && (strcmp(mode, "on") == 0 || strcmp(mode, "off") == 0)) {
+      contracts::copyMode(mode, out);
+    }
+    out.brightness = doc["brightness"] | out.brightness;
+    contracts::clampBrightness(out);
+    out.ver = doc["ver"] | out.ver;
+    return true;
+  };
+  auto loadSnapshot = [&](const String &key, const __FlashStringHelper *ctx, contracts::Desired &out) {
+    bool isNull = false;
+    String payload;
+    if (!redis.get(key, payload, &isNull)) {
+      dropRedis(ctx);
+      return -1;
+    }
+    if (isNull || !payload.length()) {
+      return 0;
+    }
+    if (!decodeSnapshot(payload, out)) {
+      logSerial.print(F("[sender] ignored invalid desired snapshot from "));
+      logSerial.println(key);
+      return 0;
+    }
+    return 1;
+  };
+  contracts::Desired snapshotDesired;
+  String desiredKey = contracts::key_desired(roomId);
+  int desiredResult = loadSnapshot(desiredKey, F("seed desired get"), snapshotDesired);
+  bool seededFromReported = false;
+  if (desiredResult < 0) {
     return false;
   }
-  if (isNull || !snapshot.length()) {
-    localVer = 0;
-    needsVersionSeed = false;
-    return true;
+  if (desiredResult == 0) {
+    String reportedKey = contracts::key_reported(roomId);
+    int reportedResult = loadSnapshot(reportedKey, F("seed reported get"), snapshotDesired);
+    if (reportedResult < 0) {
+      return false;
+    }
+    seededFromReported = reportedResult == 1;
+    if (reportedResult == 0) {
+      snapshotDesired = contracts::Desired();
+    }
   }
-  contracts::Desired desired;
-  if (!contracts::decodeDesired(snapshot, desired)) {
-    localVer = 0;
-  } else {
-    localVer = desired.ver;
-  }
+  localVer = snapshotDesired.ver;
+  lastDesired = snapshotDesired;
   needsVersionSeed = false;
+  if (localVer == 0) {
+    logSerial.println(F("[sender] desired seed missing, starting at ver 0"));
+  } else {
+    logSerial.print(F("[sender] desired seed v="));
+    logSerial.print(localVer);
+    if (seededFromReported) {
+      logSerial.println(F(" (reported)"));
+    } else {
+      logSerial.println(F(" (desired)"));
+    }
+  }
   return true;
 }
 
@@ -969,12 +1020,14 @@ void maybePublishScheduledState(unsigned long now) {
   if (!contracts::copyMode(mode, desired)) {
     return;
   }
-  if (contracts::sameDesired(desired, lastDesired)) {
+  bool same = contracts::sameDesired(desired, lastDesired);
+  if (same && !desiredForcePublish) {
     overridePublishHint = false;
     lastSchedulePublishMs = now;
     return;
   }
   if (publishDesired(desired)) {
+    desiredForcePublish = false;
     overridePublishHint = false;
     lastSchedulePublishMs = now;
   }
