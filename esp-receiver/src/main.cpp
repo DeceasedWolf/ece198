@@ -35,7 +35,8 @@ constexpr int8_t kStatusLedPin = RECEIVER_STATUS_LED_PIN;
 constexpr bool kStatusLedActiveLow = RECEIVER_STATUS_LED_ACTIVE_LOW;
 constexpr bool kStatusLedEnabled = (RECEIVER_STATUS_LED_PIN >= 0);
 constexpr bool kStatusLedSharesDriver = kStatusLedEnabled && (RECEIVER_STATUS_LED_PIN == RECEIVER_LED_PIN);
-constexpr bool kStatusLedShouldMirror = kStatusLedEnabled && !kStatusLedSharesDriver;
+constexpr bool kStatusLedControllable = kStatusLedEnabled && !kStatusLedSharesDriver;
+constexpr unsigned long kStatusLedBlinkIntervalMs = 400;
 
 struct Backoff {
   unsigned long nextMs = 0;
@@ -72,6 +73,12 @@ unsigned long lastHeartbeatMs = 0;
 unsigned long lastAnnounceMs = 0;
 String jsonScratch;
 bool wifiAnnounced = false;
+
+enum class StatusLedMode { Off, Solid, Blink };
+StatusLedMode statusLedMode = StatusLedMode::Off;
+bool statusLedBlinkState = true;
+int8_t statusLedAppliedState = -1;
+unsigned long statusLedLastToggleMs = 0;
 
 bool decodeDesiredJson(const String &payload,
                        contracts::Desired &desired,
@@ -154,6 +161,50 @@ uint16_t applyPolarity(uint16_t duty, bool activeLow) {
 
 void writeLedDuty(uint8_t pin, uint16_t duty, bool activeLow) {
   analogWrite(pin, applyPolarity(duty, activeLow));
+}
+
+void setStatusLed(bool on) {
+  if (!kStatusLedControllable) {
+    return;
+  }
+  int8_t target = on ? 1 : 0;
+  if (statusLedAppliedState == target) {
+    return;
+  }
+  statusLedAppliedState = target;
+  writeLedDuty(static_cast<uint8_t>(kStatusLedPin), on ? PWMRANGE : 0, kStatusLedActiveLow);
+}
+
+void updateStatusLed(unsigned long now) {
+  if (!kStatusLedControllable) {
+    return;
+  }
+  StatusLedMode desired = StatusLedMode::Off;
+  if (WiFi.status() == WL_CONNECTED) {
+    desired = redis.connected() ? StatusLedMode::Blink : StatusLedMode::Solid;
+  }
+  if (desired != statusLedMode) {
+    statusLedMode = desired;
+    statusLedBlinkState = true;
+    statusLedLastToggleMs = now;
+    if (desired == StatusLedMode::Blink) {
+      setStatusLed(true);
+    } else {
+      setStatusLed(desired == StatusLedMode::Solid);
+    }
+    return;
+  }
+  if (desired == StatusLedMode::Blink) {
+    if ((now - statusLedLastToggleMs) >= kStatusLedBlinkIntervalMs) {
+      statusLedBlinkState = !statusLedBlinkState;
+      statusLedLastToggleMs = now;
+      setStatusLed(statusLedBlinkState);
+    }
+  } else if (desired == StatusLedMode::Solid) {
+    setStatusLed(true);
+  } else {
+    setStatusLed(false);
+  }
 }
 
 void resetRoomState(bool dropRoomId = true) {
@@ -330,9 +381,6 @@ void applyPwm(const contracts::Desired &desired) {
     duty = map(desired.brightness, 0, 100, 0, PWMRANGE);
   }
   writeLedDuty(kLedPin, duty, kLedActiveLow);
-  if (kStatusLedShouldMirror) {
-    writeLedDuty(static_cast<uint8_t>(kStatusLedPin), duty, kStatusLedActiveLow);
-  }
   Serial.printf("[pwm] pin=%u duty=%u mode=%s brightness=%u\n",
                 static_cast<unsigned>(kLedPin),
                 static_cast<unsigned>(duty),
@@ -449,9 +497,9 @@ void setup() {
   pinMode(kLedPin, OUTPUT);
   analogWriteRange(PWMRANGE);
   writeLedDuty(kLedPin, 0, kLedActiveLow);
-  if (kStatusLedShouldMirror) {
+  if (kStatusLedControllable) {
     pinMode(static_cast<uint8_t>(kStatusLedPin), OUTPUT);
-    writeLedDuty(static_cast<uint8_t>(kStatusLedPin), 0, kStatusLedActiveLow);
+    setStatusLed(false);
   }
   WiFi.mode(WIFI_STA);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
@@ -468,6 +516,7 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  updateStatusLed(now);
   if (!ensureWifi()) {
     delay(25);
     return;

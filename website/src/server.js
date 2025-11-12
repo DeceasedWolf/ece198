@@ -491,6 +491,25 @@ function renderStatusMessage(code) {
   }
 }
 
+function sanitizeFragment(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  const trimmed = value.trim();
+  if (!trimmed || !/^[A-Za-z0-9_-]+$/.test(trimmed)) {
+    return '';
+  }
+  return trimmed;
+}
+
+function roomRedirectLocation(roomId, statusCode, anchor) {
+  const base = `/room/${encodeURIComponent(roomId)}`;
+  const query = statusCode ? `?status=${encodeURIComponent(statusCode)}` : '';
+  const fragment = sanitizeFragment(anchor);
+  const hash = fragment ? `#${fragment}` : '';
+  return `${base}${query}${hash}`;
+}
+
 function renderRoomPage(roomId, state, statusCode) {
   const message = renderStatusMessage(statusCode);
   const overrideLabel = state.override.enabled ? 'enabled' : 'disabled';
@@ -525,9 +544,10 @@ function renderRoomPage(roomId, state, statusCode) {
     <p>Configure quiet hours and manual override.</p>
   </header>
   ${message ? `<div class="status">${htmlEscape(message)}</div>` : ''}
-  <section>
+  <section id="quiet-hours">
     <h2>Quiet Hours</h2>
     <form method="POST" action="/room/${encodeURIComponent(roomId)}/quiet-hours">
+      <input type="hidden" name="anchor" value="quiet-hours">
       <label>Quiet hours start
         <input type="time" name="sleep_time" value="${htmlEscape(state.quiet.sleep)}" required>
       </label>
@@ -537,29 +557,33 @@ function renderRoomPage(roomId, state, statusCode) {
       <button type="submit" class="primary">Save Quiet Hours</button>
     </form>
   </section>
-  <section>
+  <section id="override">
     <h2>Manual Override</h2>
     <p>Override is currently <strong>${htmlEscape(overrideLabel)}</strong>${overrideSource}.</p>
     <div class="override-actions">
       <form method="POST" action="/room/${encodeURIComponent(roomId)}/override">
+        <input type="hidden" name="anchor" value="override">
         <input type="hidden" name="enabled" value="true">
         <button type="submit" class="primary">Enable Override</button>
       </form>
       <form method="POST" action="/room/${encodeURIComponent(roomId)}/override">
+        <input type="hidden" name="anchor" value="override">
         <input type="hidden" name="enabled" value="false">
         <button type="submit" class="secondary">Disable Override</button>
       </form>
     </div>
   </section>
-  <section>
+  <section id="brightness">
     <h2>Instant Brightness</h2>
     <p>Send an immediate brightness command to the room light.</p>
     <div class="quick-actions">
       <form method="POST" action="/room/${encodeURIComponent(roomId)}/brightness">
+        <input type="hidden" name="anchor" value="brightness">
         <input type="hidden" name="level" value="max">
         <button type="submit" class="primary">Full Brightness</button>
       </form>
       <form method="POST" action="/room/${encodeURIComponent(roomId)}/brightness">
+        <input type="hidden" name="anchor" value="brightness">
         <input type="hidden" name="level" value="min">
         <button type="submit" class="secondary">Lights Out</button>
       </form>
@@ -673,7 +697,8 @@ async function handleRequest(req, res) {
       schedule.wake.minute = wake.minute;
       schedule.version = Number.isInteger(schedule.version) ? schedule.version + 1 : 1;
       await saveSchedule(roomId, schedule);
-      res.writeHead(303, { Location: `/room/${encodeURIComponent(roomId)}?status=quiet-updated` });
+      const location = roomRedirectLocation(roomId, 'quiet-updated', params.get('anchor'));
+      res.writeHead(303, { Location: location });
       res.end();
       return;
     }
@@ -689,7 +714,8 @@ async function handleRequest(req, res) {
       const enabled = enabledParam === 'true';
       await setOverrideState(roomId, enabled, 'website');
       const statusCode = enabled ? 'override-enabled' : 'override-disabled';
-      res.writeHead(303, { Location: `/room/${encodeURIComponent(roomId)}?status=${statusCode}` });
+      const location = roomRedirectLocation(roomId, statusCode, params.get('anchor'));
+      res.writeHead(303, { Location: location });
       res.end();
       return;
     }
@@ -711,7 +737,8 @@ async function handleRequest(req, res) {
         return;
       }
       await sendBrightnessCommand(roomId, brightnessTarget, 'website');
-      res.writeHead(303, { Location: `/room/${encodeURIComponent(roomId)}?status=${statusCode}` });
+      const location = roomRedirectLocation(roomId, statusCode, params.get('anchor'));
+      res.writeHead(303, { Location: location });
       res.end();
       return;
     }
