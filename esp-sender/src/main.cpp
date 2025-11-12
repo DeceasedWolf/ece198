@@ -2,11 +2,43 @@
 #include <ESP8266WiFi.h>
 #include <ArduinoJson.h>
 #include <cstring>
+#include <cstdio>
 #include <time.h>
 
 #include "config.h"
 #include "contracts.hpp"
 #include "redis_link.hpp"
+
+#ifndef SENDER_DISPLAY_ENABLED
+#define SENDER_DISPLAY_ENABLED 1
+#endif
+
+#if SENDER_DISPLAY_ENABLED
+#ifndef SENDER_DISPLAY_WIDTH
+#define SENDER_DISPLAY_WIDTH 128
+#endif
+#ifndef SENDER_DISPLAY_HEIGHT
+#define SENDER_DISPLAY_HEIGHT 64
+#endif
+#ifndef SENDER_DISPLAY_I2C_ADDRESS
+#define SENDER_DISPLAY_I2C_ADDRESS 0x3C
+#endif
+#ifndef SENDER_DISPLAY_RESET_PIN
+#define SENDER_DISPLAY_RESET_PIN -1
+#endif
+#ifndef SENDER_DISPLAY_SDA_PIN
+#define SENDER_DISPLAY_SDA_PIN D2
+#endif
+#ifndef SENDER_DISPLAY_SCL_PIN
+#define SENDER_DISPLAY_SCL_PIN D1
+#endif
+#ifndef SENDER_DISPLAY_REFRESH_INTERVAL_MS
+#define SENDER_DISPLAY_REFRESH_INTERVAL_MS 1000
+#endif
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#endif
 
 #ifndef PWMRANGE
 #define PWMRANGE 1023
@@ -116,6 +148,14 @@
 #define NTP_SERVER_TERTIARY "time.cloudflare.com"
 #endif
 
+#ifndef SENDER_STATUS_LED_PIN
+#define SENDER_STATUS_LED_PIN LED_BUILTIN
+#endif
+
+#ifndef SENDER_STATUS_LED_ACTIVE_LOW
+#define SENDER_STATUS_LED_ACTIVE_LOW 1
+#endif
+
 namespace {
 
 constexpr uint16_t kStreamTrimLen = 200;
@@ -135,6 +175,35 @@ constexpr uint16_t kOverrideAnalogMax = OVERRIDE_ANALOG_MAX;
 constexpr uint8_t kOverrideAnalogMinDelta = OVERRIDE_ANALOG_MIN_DELTA;
 constexpr unsigned long kOverrideButtonDebounceMs = OVERRIDE_BUTTON_DEBOUNCE_MS;
 constexpr unsigned long kOverrideRefreshIntervalMs = 2000;
+constexpr int8_t kStatusLedPin = SENDER_STATUS_LED_PIN;
+constexpr bool kStatusLedActiveLow = SENDER_STATUS_LED_ACTIVE_LOW;
+constexpr bool kStatusLedEnabled = (SENDER_STATUS_LED_PIN >= 0);
+constexpr bool kStatusLedControllable = kStatusLedEnabled;
+constexpr unsigned long kStatusLedBlinkIntervalMs = 400;
+
+#if SENDER_DISPLAY_ENABLED
+constexpr uint8_t kDisplayWidth = SENDER_DISPLAY_WIDTH;
+constexpr uint8_t kDisplayHeight = SENDER_DISPLAY_HEIGHT;
+constexpr int8_t kDisplayResetPin = SENDER_DISPLAY_RESET_PIN;
+constexpr uint8_t kDisplayI2cAddress = SENDER_DISPLAY_I2C_ADDRESS;
+constexpr unsigned long kDisplayRefreshIntervalMs = SENDER_DISPLAY_REFRESH_INTERVAL_MS;
+constexpr uint8_t kDisplaySdaPin = SENDER_DISPLAY_SDA_PIN;
+constexpr uint8_t kDisplaySclPin = SENDER_DISPLAY_SCL_PIN;
+
+Adafruit_SSD1306 senderDisplay(kDisplayWidth, kDisplayHeight, &Wire, kDisplayResetPin);
+bool displayReady = false;
+unsigned long lastDisplayRefreshMs = 0;
+
+struct DisplayPayload {
+  char current[12]{};
+  char quietStart[12]{};
+  char quietEnd[12]{};
+  bool quietEnabled = false;
+  bool timeValid = false;
+};
+
+DisplayPayload lastDisplayPayload{};
+#endif
 
 HardwareSerial &consoleSerial = Serial;
 HardwareSerial &logSerial = Serial;
@@ -171,6 +240,8 @@ contracts::Desired lastDesired;
 bool overridePublishHint = false;
 bool desiredForcePublish = false;
 
+bool acquireLocalTime(tm &out);
+
 struct OverrideState {
   bool enabled = false;
   bool buttonStable = false;
@@ -191,6 +262,11 @@ struct OverrideMirror {
 OverrideMirror overrideMirror;
 bool overrideDirty = false;
 unsigned long lastOverrideFetchMs = 0;
+enum class StatusLedMode { Off, Solid, Blink };
+StatusLedMode statusLedMode = StatusLedMode::Off;
+bool statusLedBlinkState = true;
+int8_t statusLedAppliedState = -1;
+unsigned long statusLedLastToggleMs = 0;
 
 struct RoomSchedule {
   bool wakeEnabled = true;
@@ -215,6 +291,125 @@ bool timeConfigured = false;
 bool timeAnnounced = false;
 unsigned long lastTimeSyncAttemptMs = 0;
 
+#if SENDER_DISPLAY_ENABLED
+void writeTimePlaceholder(char *dst, size_t len) {
+  if (!len) {
+    return;
+  }
+  static constexpr char kPlaceholder[] = "--:-- --";
+  std::snprintf(dst, len, "%s", kPlaceholder);
+}
+
+void formatMinutes12(uint16_t minutes, char *dst, size_t len) {
+  if (!len) {
+    return;
+  }
+  minutes %= kMinutesPerDay;
+  uint8_t hour24 = minutes / 60;
+  uint8_t minute = minutes % 60;
+  uint8_t hour12 = hour24 % 12;
+  if (hour12 == 0) {
+    hour12 = 12;
+  }
+  const char *suffix = hour24 >= 12 ? "PM" : "AM";
+  std::snprintf(dst, len, "%02u:%02u %s", hour12, minute, suffix);
+}
+
+void formatCurrentTime(const tm &now, char *dst, size_t len) {
+  uint16_t minutes = static_cast<uint16_t>(((now.tm_hour % 24) * 60) + now.tm_min);
+  formatMinutes12(minutes, dst, len);
+}
+
+bool payloadChanged(const DisplayPayload &a, const DisplayPayload &b) {
+  if (a.timeValid != b.timeValid || a.quietEnabled != b.quietEnabled) {
+    return true;
+  }
+  if (std::strcmp(a.current, b.current) != 0) {
+    return true;
+  }
+  if (std::strcmp(a.quietStart, b.quietStart) != 0) {
+    return true;
+  }
+  if (std::strcmp(a.quietEnd, b.quietEnd) != 0) {
+    return true;
+  }
+  return false;
+}
+
+void renderDisplay(const DisplayPayload &payload) {
+  if (!displayReady) {
+    return;
+  }
+  senderDisplay.clearDisplay();
+  senderDisplay.setTextColor(SSD1306_WHITE);
+  senderDisplay.setTextSize(2);
+  senderDisplay.setCursor(0, 0);
+  senderDisplay.println(payload.current);
+  senderDisplay.setTextSize(1);
+  senderDisplay.setCursor(0, 32);
+  senderDisplay.println(F("Quiet Hours:"));
+  senderDisplay.setCursor(0, 46);
+  char range[32];
+  std::snprintf(range, sizeof(range), "%s - %s", payload.quietStart, payload.quietEnd);
+  senderDisplay.println(range);
+  senderDisplay.display();
+}
+
+void composeDisplayPayload(DisplayPayload &payload) {
+  tm localNow;
+  payload.timeValid = acquireLocalTime(localNow);
+  if (payload.timeValid) {
+    formatCurrentTime(localNow, payload.current, sizeof(payload.current));
+  } else {
+    writeTimePlaceholder(payload.current, sizeof(payload.current));
+  }
+  payload.quietEnabled = scheduleCfg.nightEnabled && scheduleCfg.wakeEnabled;
+  if (payload.quietEnabled) {
+    formatMinutes12(scheduleCfg.nightStartMin, payload.quietStart, sizeof(payload.quietStart));
+    formatMinutes12(scheduleCfg.wakeStartMin, payload.quietEnd, sizeof(payload.quietEnd));
+  } else {
+    writeTimePlaceholder(payload.quietStart, sizeof(payload.quietStart));
+    writeTimePlaceholder(payload.quietEnd, sizeof(payload.quietEnd));
+  }
+}
+
+void initDisplayHardware() {
+  if (displayReady) {
+    return;
+  }
+  Wire.begin(kDisplaySdaPin, kDisplaySclPin);
+  if (!senderDisplay.begin(SSD1306_SWITCHCAPVCC, kDisplayI2cAddress)) {
+    logSerial.println(F("[display] init failed"));
+    return;
+  }
+  senderDisplay.clearDisplay();
+  senderDisplay.setTextColor(SSD1306_WHITE);
+  senderDisplay.setTextSize(1);
+  senderDisplay.setCursor(0, 0);
+  senderDisplay.println(F("Booting..."));
+  senderDisplay.display();
+  displayReady = true;
+  lastDisplayPayload = DisplayPayload();
+}
+
+void maybeUpdateDisplay(unsigned long now) {
+  if (!displayReady) {
+    return;
+  }
+  if ((now - lastDisplayRefreshMs) < kDisplayRefreshIntervalMs) {
+    return;
+  }
+  lastDisplayRefreshMs = now;
+  DisplayPayload payload;
+  composeDisplayPayload(payload);
+  if (!payloadChanged(payload, lastDisplayPayload)) {
+    return;
+  }
+  renderDisplay(payload);
+  lastDisplayPayload = payload;
+}
+#endif
+
 char consoleBuffer[kConsoleMaxBytes]{};
 size_t consoleLen = 0;
 unsigned long consoleLastByteMs = 0;
@@ -229,6 +424,51 @@ void logRedisFailure(const __FlashStringHelper *where) {
   logSerial.print(where);
   logSerial.print(F(": "));
   logSerial.println(redis.lastError());
+}
+
+void setStatusLed(bool on) {
+  if (!kStatusLedControllable) {
+    return;
+  }
+  int8_t target = on ? 1 : 0;
+  if (statusLedAppliedState == target) {
+    return;
+  }
+  statusLedAppliedState = target;
+  bool levelHigh = on ? !kStatusLedActiveLow : kStatusLedActiveLow;
+  digitalWrite(static_cast<uint8_t>(kStatusLedPin), levelHigh ? HIGH : LOW);
+}
+
+void updateStatusLed(unsigned long now) {
+  if (!kStatusLedControllable) {
+    return;
+  }
+  StatusLedMode desired = StatusLedMode::Off;
+  if (WiFi.status() == WL_CONNECTED) {
+    desired = redis.connected() ? StatusLedMode::Blink : StatusLedMode::Solid;
+  }
+  if (desired != statusLedMode) {
+    statusLedMode = desired;
+    statusLedBlinkState = true;
+    statusLedLastToggleMs = now;
+    if (desired == StatusLedMode::Blink) {
+      setStatusLed(true);
+    } else {
+      setStatusLed(desired == StatusLedMode::Solid);
+    }
+    return;
+  }
+  if (desired == StatusLedMode::Blink) {
+    if ((now - statusLedLastToggleMs) >= kStatusLedBlinkIntervalMs) {
+      statusLedBlinkState = !statusLedBlinkState;
+      statusLedLastToggleMs = now;
+      setStatusLed(statusLedBlinkState);
+    }
+  } else if (desired == StatusLedMode::Solid) {
+    setStatusLed(true);
+  } else {
+    setStatusLed(false);
+  }
 }
 
 void resetState() {
@@ -1039,6 +1279,13 @@ void setup() {
   consoleSerial.begin(SENDER_CONSOLE_BAUD);
   log(F("boot"));
   initOverrideHardware();
+#if SENDER_DISPLAY_ENABLED
+  initDisplayHardware();
+#endif
+  if (kStatusLedControllable) {
+    pinMode(static_cast<uint8_t>(kStatusLedPin), OUTPUT);
+    setStatusLed(false);
+  }
   WiFi.mode(WIFI_STA);
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
 #ifdef WIFI_HOSTNAME
@@ -1055,8 +1302,12 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+  updateStatusLed(now);
   pumpConsole();
   pumpOverrideInputs(now);
+#if SENDER_DISPLAY_ENABLED
+  maybeUpdateDisplay(now);
+#endif
   ensureRoomFromOverride();
   if (!ensureWifi()) {
     maybeRequestRoom(now);

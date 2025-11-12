@@ -58,6 +58,13 @@
 #define OVERRIDE_ANALOG_MAX 1023
 #define OVERRIDE_ANALOG_MIN_DELTA 2
 
+// Small status OLED (defaults assume I2C wiring: SCL->D1, SDA->D2, power from 3.3V).
+#define SENDER_DISPLAY_ENABLED 1
+#define SENDER_DISPLAY_SCL_PIN D1
+#define SENDER_DISPLAY_SDA_PIN D2
+#define SENDER_DISPLAY_I2C_ADDRESS 0x3C
+#define SENDER_DISPLAY_REFRESH_INTERVAL_MS 1000
+
 // Timekeeping (seconds relative to UTC). Adjust for deployment timezone/DST.
 #define TZ_OFFSET_SECONDS (-5 * 3600)
 #define DST_OFFSET_SECONDS 0
