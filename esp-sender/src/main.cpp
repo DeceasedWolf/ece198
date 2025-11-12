@@ -247,19 +247,40 @@ void dropRedis(const __FlashStringHelper *context) {
   resetState();
 }
 
+void connectWifiBlocking() {
+  logSerial.print(F("[wifi] connecting to "));
+  logSerial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    logSerial.print(F("[wifi] status="));
+    logSerial.println(static_cast<int>(WiFi.status()));
+    delay(500);
+    if ((millis() - start) > 20000) {
+      logSerial.println(F("[wifi] retrying connection"));
+      WiFi.disconnect(false);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      start = millis();
+    }
+  }
+  logSerial.print(F("[wifi] connected ip="));
+  logSerial.print(WiFi.localIP());
+  logSerial.print(F(" rssi="));
+  logSerial.println(WiFi.RSSI());
+}
+
 bool ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiBackoff.reset();
     return true;
   }
-  unsigned long now = millis();
-  if (!wifiBackoff.ready(now)) {
-    return false;
-  }
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  wifiBackoff.schedule(now);
-  return false;
+  connectWifiBlocking();
+  wifiBackoff.reset();
+  return WiFi.status() == WL_CONNECTED;
 }
 
 bool ensureRedis() {
@@ -459,6 +480,8 @@ bool decodeOverrideJson(const String &json, bool &enabled, uint32_t &version) {
   }
   return true;
 }
+
+bool timeIsValid();
 
 uint32_t overrideTimestamp() {
   if (timeIsValid()) {
@@ -752,8 +775,8 @@ bool publishDesired(contracts::Desired &desired) {
 
 
 void ensureRoomFromOverride() {
-#if defined(ROOM_ID_OVERRIDE) && (sizeof(ROOM_ID_OVERRIDE) > 1)
-  if (!roomId.length()) {
+#if defined(ROOM_ID_OVERRIDE)
+  if (!roomId.length() && ROOM_ID_OVERRIDE[0] != '\0') {
     roomId = F(ROOM_ID_OVERRIDE);
     logSerial.print(F("[sender] room override -> "));
     logSerial.println(roomId);

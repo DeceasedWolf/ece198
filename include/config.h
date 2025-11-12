@@ -16,7 +16,7 @@
 #define REDIS_PASSWORD ""
 
 // Optional overrides for early bring-up. Leave empty to rely on provisioning.
-#define ROOM_ID_OVERRIDE ""
+#define ROOM_ID_OVERRIDE "100"
 #define PROVISIONING_BASE_ID 100
 
 // How often (in milliseconds) the receiver announces its room id over UART.

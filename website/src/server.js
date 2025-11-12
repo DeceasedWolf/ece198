@@ -692,6 +692,7 @@ async function handleRequest(req, res) {
       schedule.night.enabled = true;
       schedule.night.hour = sleep.hour;
       schedule.night.minute = sleep.minute;
+      schedule.night.brightness = 0;
       schedule.wake.enabled = true;
       schedule.wake.hour = wake.hour;
       schedule.wake.minute = wake.minute;
