@@ -22,19 +22,102 @@ constexpr uint16_t kRedisTimeoutMs = 1500;
 #ifndef RECEIVER_LED_ACTIVE_LOW
 #define RECEIVER_LED_ACTIVE_LOW 0
 #endif
+#ifndef RECEIVER_LED_RED_PIN
+#define RECEIVER_LED_RED_PIN -1
+#endif
+#ifndef RECEIVER_LED_GREEN_PIN
+#define RECEIVER_LED_GREEN_PIN -1
+#endif
+#ifndef RECEIVER_LED_BLUE_PIN
+#define RECEIVER_LED_BLUE_PIN -1
+#endif
+#ifndef RECEIVER_LED_RED_PERCENT
+#define RECEIVER_LED_RED_PERCENT 0
+#endif
+#ifndef RECEIVER_LED_GREEN_PERCENT
+#define RECEIVER_LED_GREEN_PERCENT 0
+#endif
+#ifndef RECEIVER_LED_BLUE_PERCENT
+#define RECEIVER_LED_BLUE_PERCENT 0
+#endif
 #ifndef RECEIVER_STATUS_LED_PIN
 #define RECEIVER_STATUS_LED_PIN LED_BUILTIN
 #endif
 #ifndef RECEIVER_STATUS_LED_ACTIVE_LOW
 #define RECEIVER_STATUS_LED_ACTIVE_LOW 1
 #endif
+#ifndef RECEIVER_LED_HAS_RGB
+#if (RECEIVER_LED_RED_PIN >= 0) || (RECEIVER_LED_GREEN_PIN >= 0) || (RECEIVER_LED_BLUE_PIN >= 0)
+#define RECEIVER_LED_HAS_RGB 1
+#else
+#define RECEIVER_LED_HAS_RGB 0
+#endif
+#endif
 
-constexpr uint8_t kLedPin = RECEIVER_LED_PIN;
+static_assert(RECEIVER_LED_RED_PERCENT >= 0 && RECEIVER_LED_RED_PERCENT <= 100,
+              "RECEIVER_LED_RED_PERCENT must be between 0 and 100");
+static_assert(RECEIVER_LED_GREEN_PERCENT >= 0 && RECEIVER_LED_GREEN_PERCENT <= 100,
+              "RECEIVER_LED_GREEN_PERCENT must be between 0 and 100");
+static_assert(RECEIVER_LED_BLUE_PERCENT >= 0 && RECEIVER_LED_BLUE_PERCENT <= 100,
+              "RECEIVER_LED_BLUE_PERCENT must be between 0 and 100");
+
 constexpr bool kLedActiveLow = RECEIVER_LED_ACTIVE_LOW;
 constexpr int8_t kStatusLedPin = RECEIVER_STATUS_LED_PIN;
 constexpr bool kStatusLedActiveLow = RECEIVER_STATUS_LED_ACTIVE_LOW;
 constexpr bool kStatusLedEnabled = (RECEIVER_STATUS_LED_PIN >= 0);
-constexpr bool kStatusLedSharesDriver = kStatusLedEnabled && (RECEIVER_STATUS_LED_PIN == RECEIVER_LED_PIN);
+
+constexpr uint16_t percentToDuty(uint8_t percent) {
+  return static_cast<uint16_t>((static_cast<uint32_t>(percent) * PWMRANGE) / 100);
+}
+
+struct LedChannel {
+  uint8_t pin;
+  uint16_t maxDuty;
+};
+
+#if RECEIVER_LED_HAS_RGB
+constexpr LedChannel kLedChannels[] = {
+#if RECEIVER_LED_RED_PIN >= 0
+    {static_cast<uint8_t>(RECEIVER_LED_RED_PIN),
+     percentToDuty(static_cast<uint8_t>(RECEIVER_LED_RED_PERCENT))},
+#endif
+#if RECEIVER_LED_GREEN_PIN >= 0
+    {static_cast<uint8_t>(RECEIVER_LED_GREEN_PIN),
+     percentToDuty(static_cast<uint8_t>(RECEIVER_LED_GREEN_PERCENT))},
+#endif
+#if RECEIVER_LED_BLUE_PIN >= 0
+    {static_cast<uint8_t>(RECEIVER_LED_BLUE_PIN),
+     percentToDuty(static_cast<uint8_t>(RECEIVER_LED_BLUE_PERCENT))},
+#endif
+};
+#else
+constexpr LedChannel kLedChannels[] = {
+    {static_cast<uint8_t>(RECEIVER_LED_PIN), percentToDuty(100)},
+};
+#endif
+
+constexpr size_t kLedChannelCount = sizeof(kLedChannels) / sizeof(kLedChannels[0]);
+static_assert(kLedChannelCount > 0, "At least one LED channel must be configured");
+
+constexpr bool statusLedSharesDriverPin() {
+#if RECEIVER_LED_HAS_RGB
+  return false
+#if RECEIVER_LED_RED_PIN >= 0
+         || (RECEIVER_STATUS_LED_PIN == RECEIVER_LED_RED_PIN)
+#endif
+#if RECEIVER_LED_GREEN_PIN >= 0
+         || (RECEIVER_STATUS_LED_PIN == RECEIVER_LED_GREEN_PIN)
+#endif
+#if RECEIVER_LED_BLUE_PIN >= 0
+         || (RECEIVER_STATUS_LED_PIN == RECEIVER_LED_BLUE_PIN)
+#endif
+      ;
+#else
+  return (RECEIVER_STATUS_LED_PIN == RECEIVER_LED_PIN);
+#endif
+}
+
+constexpr bool kStatusLedSharesDriver = kStatusLedEnabled && statusLedSharesDriverPin();
 constexpr bool kStatusLedControllable = kStatusLedEnabled && !kStatusLedSharesDriver;
 constexpr unsigned long kStatusLedBlinkIntervalMs = 400;
 
@@ -376,14 +459,16 @@ bool provisionRoom() {
 }
 
 void applyPwm(const contracts::Desired &desired) {
-  uint16_t duty = 0;
+  uint16_t brightnessDuty = 0;
   if (strcmp(desired.mode, "on") == 0 && desired.brightness > 0) {
-    duty = map(desired.brightness, 0, 100, 0, PWMRANGE);
+    brightnessDuty = map(desired.brightness, 0, 100, 0, PWMRANGE);
   }
-  writeLedDuty(kLedPin, duty, kLedActiveLow);
-  Serial.printf("[pwm] pin=%u duty=%u mode=%s brightness=%u\n",
-                static_cast<unsigned>(kLedPin),
-                static_cast<unsigned>(duty),
+  for (const auto &channel : kLedChannels) {
+    uint32_t duty = (static_cast<uint32_t>(channel.maxDuty) * brightnessDuty) / PWMRANGE;
+    writeLedDuty(channel.pin, static_cast<uint16_t>(duty), kLedActiveLow);
+  }
+  Serial.printf("[pwm] duty=%u mode=%s brightness=%u\n",
+                static_cast<unsigned>(brightnessDuty),
                 desired.mode,
                 static_cast<unsigned>(desired.brightness));
 }
@@ -494,9 +579,11 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   logInfo(F("boot"));
-  pinMode(kLedPin, OUTPUT);
   analogWriteRange(PWMRANGE);
-  writeLedDuty(kLedPin, 0, kLedActiveLow);
+  for (const auto &channel : kLedChannels) {
+    pinMode(channel.pin, OUTPUT);
+    writeLedDuty(channel.pin, 0, kLedActiveLow);
+  }
   if (kStatusLedControllable) {
     pinMode(static_cast<uint8_t>(kStatusLedPin), OUTPUT);
     setStatusLed(false);

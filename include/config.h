@@ -29,6 +29,17 @@
 #define RECEIVER_LED_PIN D5
 #define RECEIVER_LED_ACTIVE_LOW 0
 
+// Optional RGB channel wiring. Set any unused channel to -1. When at least one
+// channel is enabled the mix percentages below drive the overall color.
+#define RECEIVER_LED_RED_PIN D1
+#define RECEIVER_LED_GREEN_PIN D2
+#define RECEIVER_LED_BLUE_PIN D5
+
+// Channel mix (0-100) targeting RGB(255,254,208) on the common-cathode LED.
+#define RECEIVER_LED_RED_PERCENT 100
+#define RECEIVER_LED_GREEN_PERCENT 99
+#define RECEIVER_LED_BLUE_PERCENT 55
+
 // Optional status LED (set to LED_BUILTIN to mirror the applied brightness, or -1 to disable).
 #define RECEIVER_STATUS_LED_PIN LED_BUILTIN
 #define RECEIVER_STATUS_LED_ACTIVE_LOW 1

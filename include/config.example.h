@@ -29,6 +29,17 @@
 #define RECEIVER_LED_PIN D4
 #define RECEIVER_LED_ACTIVE_LOW 0
 
+// Optional RGB channel wiring. Set channels to -1 to disable and rely on the
+// legacy single LED pin.
+#define RECEIVER_LED_RED_PIN -1
+#define RECEIVER_LED_GREEN_PIN -1
+#define RECEIVER_LED_BLUE_PIN -1
+
+// Per-channel mix (0-100) applied when RGB wiring is enabled.
+#define RECEIVER_LED_RED_PERCENT 100
+#define RECEIVER_LED_GREEN_PERCENT 100
+#define RECEIVER_LED_BLUE_PERCENT 100
+
 // Optional status LED (set to LED_BUILTIN to mirror the applied brightness, or -1 to disable).
 #define RECEIVER_STATUS_LED_PIN LED_BUILTIN
 #define RECEIVER_STATUS_LED_ACTIVE_LOW 1
