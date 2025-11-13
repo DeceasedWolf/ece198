@@ -1,24 +1,22 @@
 # Website Controls
 
-This directory contains a dependency-free Node.js server that exposes a simple per-room UI for
-updating quiet hours and toggling the manual override (the same state that exists on the physical
-control panel button).
+This package contains the dependency-free Node.js server that powers the quiet-hours and manual-override experience for every room. It speaks Redis RESP directly over TCP (no `node-redis` dependency) so the only runtime requirement is Node 18+.
 
 ## Prerequisites
 
-- Node.js 18+ (needed for the built-in `fetch`-free HTTP/RESP implementation).
-- Access to the same Redis instance that the ESP sender/receiver use.
+- Node.js 18 or newer.
+- Network access to the same Redis instance the ESP firmware targets use (usually the `docker compose` stack that listens on `localhost:6379` during development).
 
 ## Configuration
 
-The server reads a few environment variables (all optional):
+All configuration is optional and provided through environment variables:
 
-| Variable        | Default        | Description                              |
-| --------------- | -------------- | ---------------------------------------- |
-| `PORT`          | `3000`         | Port that the HTTP server listens on.    |
-| `REDIS_HOST`    | `127.0.0.1`    | Redis hostname or IP.                    |
-| `REDIS_PORT`    | `6379`         | Redis TCP port.                          |
-| `REDIS_PASSWORD`| *(empty)*      | Password if Redis AUTH is enabled.       |
+| Variable                  | Default     | Description                                                                 |
+| ------------------------- | ----------- | --------------------------------------------------------------------------- |
+| `PORT` / `WEB_PORT`       | `3000`      | HTTP listen port (both names are accepted; `PORT` takes precedence).        |
+| `REDIS_HOST`              | `127.0.0.1` | Redis hostname or IP address.                                               |
+| `REDIS_PORT`              | `6379`      | Redis TCP port.                                                             |
+| `REDIS_PASSWORD`          | *(empty)*   | Password for Redis `AUTH`, if enabled.                                      |
 
 ## Running
 
@@ -27,19 +25,47 @@ cd website
 npm start
 ```
 
-Open `http://localhost:3000/` and enter a room id. Each room has its own URL
-(`http://localhost:3000/room/101`, etc.) where occupants can:
+No `npm install` step is necessary because the project has zero third-party dependencies. Once the server is running, open `http://localhost:3000/` and enter a room id (for example `101`).
 
-- Set their preferred quiet-hours start (lights dim) and wake time (lights brighten).
-- Enable/disable the manual override, mirroring the hardware button.
+## UI Features
 
-### API
+- **Home page (`/`)** – simple form that redirects to `/room/{id}` after validating the room id.
+- **Room page (`/room/{id}`)** – renders quiet-hour forms, override status, and brightness quick actions. Status messages confirm each successful change.
+  - Quiet hours form rewrites `room:{id}:cfg`, ensuring `night.enabled` and `wake.enabled` are both true and forcing `night.brightness` to 0 for quiet mode.
+  - Manual override buttons map to the same Redis key (`room:{id}:override`) that the hardware button updates, including the version counter so whichever side wrote last wins.
+  - Instant brightness buttons are meant for testing—they immediately write `room:{id}:desired` and append to `cmd:room:{id}` so the receiver reacts even if the sender is offline.
 
-The HTML UI sits on top of a small API that can also be scripted:
+## API Endpoints
 
-- `GET /api/rooms/{id}` – returns the merged schedule plus the current override snapshot.
-- `POST /room/{id}/quiet-hours` – accepts form data (`sleep_time=HH:MM`, `wake_time=HH:MM`).
-- `POST /room/{id}/override` – accepts form data (`enabled=true|false`).
+Every form submit results in a `303 See Other` redirect back to `/room/{id}` with a status query string so the user sees an inline confirmation. You can also call the backing endpoints directly:
 
-All changes are persisted in Redis under `room:{id}:cfg` (quiet hours) and `room:{id}:override`
-(override state) so that the ESP sender/receiver can observe them.
+| Method & Path                  | Description                                                                                   | Redis keys touched                               |
+| ------------------------------ | --------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| `GET /`                       | Landing page with the room selector.                                                          | *(none)*                                         |
+| `GET /room/{id}`              | Renders the HTML UI by merging defaults with `room:{id}:cfg` and `room:{id}:override`.        | `room:{id}:cfg`, `room:{id}:override`, `room:{id}:desired` |
+| `POST /room/{id}/quiet-hours` | Form fields `sleep_time=HH:MM`, `wake_time=HH:MM`. Updates the stored schedule JSON.          | `room:{id}:cfg`                                  |
+| `POST /room/{id}/override`    | Form field `enabled=true|false`. Bumps the override version and records `source=website`.     | `room:{id}:override`                             |
+| `POST /room/{id}/brightness`  | Form field `level=max|min`. Rewrites `room:{id}:desired`, emits `cmd:room:{id}`, trims stream.| `room:{id}:desired`, `cmd:room:{id}`             |
+| `GET /api/rooms/{id}`         | Returns JSON `{ room, schedule, quiet, override }` (schedule already merged with defaults).   | Same as the room page                            |
+| `GET /healthz`                | Performs a Redis `PING` to ensure the RESP connection is healthy.                            | *(none beyond PING)*                             |
+
+All endpoints reject invalid room ids and return `404` if the route does not exist. Quiet-hours and override payloads match the shapes expected by `esp-sender`, so the devices see the changes within ~2 seconds of submission.
+
+## Data Model
+
+- Quiet hours → `room:{id}:cfg` JSON (`baseline`, `wake`, `night`, `version`). The website only mutates the quiet-hour fields; other fields survive untouched because the server merges the stored payload with the defaults before writing.
+- Manual override → `room:{id}:override` JSON (`enabled`, incrementing `ver`, `updated_at` epoch ms, `source="website"`).
+- Instant brightness → `room:{id}:desired` snapshot (includes `mode`, `brightness`, `ver`, `room`, `source`) plus `cmd:room:{id}` stream entries with the serialized payload tagged as field `p`.
+
+Use `curl` or any HTTP client if you need to automate changes:
+
+```bash
+curl -X POST http://localhost:3000/room/101/quiet-hours \
+  -d 'sleep_time=21:00' \
+  -d 'wake_time=06:30'
+
+curl -X POST http://localhost:3000/room/101/override \
+  -d 'enabled=true'
+```
+
+Because this server talks to the same Redis instance as the ESP firmware, any change made through the UI is reflected on the physical hardware (and vice versa) without additional glue code.

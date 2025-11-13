@@ -1,108 +1,142 @@
 # Hospital Lighting Control System
 
-Two PlatformIO projects plus a shared contracts header implement a Redis-driven demo for hospital room lighting. Each room has an ESP8266 sender that synchronizes time, pulls schedule/configuration data from Redis, computes the desired LED output, and publishes it, while an ESP8266 receiver applies the latest snapshot plus future stream updates.
+This repo implements a Redis-backed hospital room lighting demo that pairs two ESP8266 firmware targets with a dependency-free Node.js web UI. The ESP "sender" board acts as the room scheduler and manual override panel, the ESP "receiver" board drives the light output, and the website lets staff adjust quiet hours or trigger overrides without touching hardware.
 
 ## Repository Layout
 
-- `include/config.example.h` - copy to `include/config.h` and edit Wi-Fi/Redis settings.
-- `contracts/` - header-only library with Redis key helpers and JSON codecs.
-- `esp-sender/` - ESP8266 D1 mini scheduler that pulls Redis config, computes desired states, and writes Redis keys/streams.
-- `esp-receiver/` - ESP8266 D1 mini that provisions a room id, applies LED PWM, heartbeats, and acks.
-- `website/` - lightweight Node.js UI + API for editing quiet hours and toggling manual override per room.
-- `docker/docker-compose.yml` - Redis 7 with AOF enabled for local testing.
+- `include/config.example.h` – copy to `include/config.h` and edit Wi-Fi, Redis, and hardware pin/polarity settings.
+- `contracts/` – header-only helper library that defines Redis key conventions, stream names, and `Desired` JSON codecs shared by both PlatformIO projects.
+- `esp-sender/` – PlatformIO project for the ESP8266 room scheduler + manual override panel (console prompt, rotary pot, button, optional SSD1306 display, and status LED).
+- `esp-receiver/` – PlatformIO project for the ESP8266 LED driver that provisions a room id, tracks command streams, drives PWM (single channel or RGB mix), and reports telemetry.
+- `website/` – minimal Node 18 HTTP/RESP server that renders the per-room UI and exposes matching API endpoints.
+- `docker-compose.yml` – Redis 7 container with append-only persistence for local development.
+- `docs/` – planning notes and acceptance criteria (`docs/planning.md`).
 
 ## Quick Start
 
-1. `cp include/config.example.h include/config.h` and adjust:
-   - `WIFI_SSID`, `WIFI_PASS`, and optional `WIFI_HOSTNAME`.
-   - `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`.
-2. Bring up Redis:
+1. **Configure firmware**
+   - `cp include/config.example.h include/config.h`
+   - Adjust Wi-Fi (`WIFI_SSID`, `WIFI_PASS`, optional `WIFI_HOSTNAME`) and Redis settings (`REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`).
+   - Set GPIO selections for the receiver LED channels/driver and the manual-override hardware if they differ from the defaults.
+2. **Start Redis locally**
    ```bash
-   cd docker
    docker compose up -d
    ```
-   Redis stores data under the named `redis-data` volume with append-only persistence enabled.
-3. Build/flash each PlatformIO environment from the repo root (PlatformIO CLI):
-```bash
-pio run -e esp_sender -t upload
-pio run -e esp_receiver -t upload
-```
-   Open a serial monitor at `115200` when needed (e.g. `pio device monitor -e esp_receiver -b 115200`). You can still run inside a subdirectory with `-d` if you prefer that workflow.
-
-### Website
-
-```bash
-cd website
-npm start
-```
-
-Navigate to `http://localhost:3000/` and enter a room id (for example, `101`). Each room page (`/room/{id}`) offers:
-
-- Quiet hours form – wires the sleep/wake times into `room:{id}:cfg`.
-- Manual override controls – mirrors the control-panel button by writing `room:{id}:override`.
-
-## Wiring Overview
-
-- **ESP sender**
-  - Power the D1 mini (or similar ESP8266) from USB or a regulated 3.3 V rail and keep the USB/UART console accessible at `SENDER_CONSOLE_BAUD` so you can answer the `ROOM?` prompt (or just set `ROOM_ID_OVERRIDE`).
-  - No external Arduino panel is required; the sender calculates brightness locally from the Redis schedule and current time.
-- **Receiver LED output**
-  - `RECEIVER_LED_PIN` selects the PWM GPIO for the room light. For anything beyond a small indicator LED, use a MOSFET/transistor and a dedicated LED supply rail (include a flyback diode if inductive).
-  - `RECEIVER_STATUS_LED_PIN` mirrors the applied brightness on an auxiliary indicator (set it to `LED_BUILTIN` to watch the onboard LED, or `-1` to disable). Remember the built-in LED on many ESP8266 boards sits on `D4` and is active-low, so if you also drive your room LED from `D4` the onboard LED will appear inverted—move the room LED to another pin (e.g. `D1`) if you want both to match.
-  - Set `RECEIVER_LED_ACTIVE_LOW` (and `RECEIVER_STATUS_LED_ACTIVE_LOW` when needed) when the corresponding LED turns on as the pin is driven low.
-- **Networking**
-  - Both ESP8266 boards operate in STA mode on the same 2.4GHz SSID. Keep them on an isolated lab VLAN when possible.
+   The stack listens on `localhost:6379` and persists to the named `redis-data` volume.
+3. **Build and flash the firmware (PlatformIO CLI)**
+   ```bash
+   pio run -e esp_sender -t upload
+   pio run -e esp_receiver -t upload
+   ```
+   - Use `pio device monitor -e esp_sender -b 115200` (or `esp_receiver`) to watch logs.
+   - The sender prints `ROOM?` until you type `ROOM:<id>` over USB (or set `ROOM_ID_OVERRIDE` in `config.h`).
+4. **Run the website**
+   ```bash
+   cd website
+   npm start
+   ```
+   - Requires Node.js 18+ (uses the built-in `net` module for RESP; there are no npm dependencies).
+   - Navigate to `http://localhost:3000/` and open a room such as `/room/101`. The server can also run on another host—set `PORT`/`WEB_PORT`, `REDIS_HOST`, `REDIS_PORT`, and `REDIS_PASSWORD` as needed.
 
 ## Firmware Behavior
 
-- **ESP sender (scheduler)**
-  - Prompts for `ROOM:<id>` over USB (or applies `ROOM_ID_OVERRIDE`), synchronizes time via SNTP (`TZ_OFFSET_SECONDS` / `DST_OFFSET_SECONDS`), and polls `room:{id}:cfg` every `SCHEDULE_REFRESH_MS`.
-  - Builds the desired LED state from the wake/night schedule plus the configured baseline brightness and only publishes when the computed state changes. Publishes update snapshots to `room:{id}:desired` plus `cmd:room:{id}` with `XTRIM ~ 200`.
-  - Falls back to the defaults from `include/config.h` whenever no config is available or JSON is invalid, so the room still has a predictable sunrise/night cycle.
-- **ESP receiver**
-  - Connects to Wi-Fi/Redis, runs the provisioning Lua (`device:{mac}:room`), prints `ROOM:<id>` over UART, applies the latest desired snapshot, and starts `XREAD BLOCK 1000 STREAMS cmd:room:{id} $`.
-  - Drives LED PWM, records `room:{id}:reported`, emits `state:room:{id}` acks, trims streams, and sends `room:{id}:online` heartbeats every 3 s (TTL 10 s). Re-provisions after reconnect and ignores stale `ver`.
+### ESP sender (scheduler + control panel)
 
-## Room Configuration
+- Prompts for a room id via serial (`ROOM?`) or applies the compile-time `ROOM_ID_OVERRIDE`. Once a room is known it seeds the current desired snapshot (`room:{id}:desired`, falling back to `room:{id}:reported`) to keep version counters monotonic.
+- Synchronizes time with SNTP (`TZ_OFFSET_SECONDS` / `DST_OFFSET_SECONDS` + `NTP_SERVER_*`) and polls `room:{id}:cfg` every `SCHEDULE_REFRESH_MS`. Missing or invalid JSON reverts to the defaults in `config.h`.
+- Computes the desired brightness from the baseline, programmable sunrise ramp (`wake` window), and quiet-hours dim path (`night` window plus `QUIET_HOURS_DIM_MINUTES`). Only publishes when the calculated state changes or a manual override is active.
+- Publishes desired states to `room:{id}:desired` and `cmd:room:{id}` (trimmed to `~200` entries) and mirrors the last packet locally so drops/reconnects continue smoothly.
+- Implements the manual override hardware: a debounced button toggles override mode, while the analog potentiometer selects brightness (0–100%). Each change is written to `room:{id}:override` (`enabled`, `ver`, `updated_at`, `source=device`) so the website stays in sync.
+- Polls `room:{id}:override` to honor remote toggles from the web UI, pushes overrides immediately to the desired snapshot, and clears the override once disabled.
+- Optional UX features: an SSD1306 display (if `SENDER_DISPLAY_ENABLED`) shows current time + quiet-hour window, and a status LED blinks while Redis is healthy (solid when only Wi-Fi is linked).
 
-Room-level settings live at `room:{id}:cfg` as JSON. The sender merges the payload with the defaults from `include/config.h`, so you only need to set what changes per room. Supported fields:
+### ESP receiver (actuator)
 
-- `baseline.brightness` – percent (0-100) used outside any wake/night window.
-- `wake`: `{ "enabled": true, "hour": 7, "minute": 0, "duration_min": 20, "brightness": 100 }` ramps up from the baseline to `brightness` across `duration_min`.
-- `night`: `{ "enabled": true, "hour": 22, "minute": 0, "brightness": 5 }` forces a low level from the configured time through the next wake window.
-- Optional `version` value is logged for traceability.
+- Connects to Wi-Fi STA mode, authenticates to Redis, and executes the provisioning Lua script that maps the device MAC to a room id (`device:{mac}:room`, `rooms:next_id`). If the room did not exist, the script seeds `room:{id}:desired`.
+- Prints `ROOM:<id>` on the UART every `ROOM_ANNOUNCE_INTERVAL_MS` so you can log deployments or feed the sender prompt manually.
+- Loads the latest desired snapshot, applies PWM to the configured LED channel(s), and records the applied state to both `room:{id}:reported` (overwrite) and `state:room:{id}` (stream trimmed to `~200` entries). Optional RGB wiring mixes duty cycles per channel with independent polarity and mix percentages.
+- Subscribes to `cmd:room:{id}` with `XREAD BLOCK 1000` and applies every streamed payload whose `ver` is newer than the last applied version.
+- Sends `room:{id}:online` heartbeats (TTL `contracts::kHeartbeatTtlSec`) and exposes LED/Wi-Fi/Redis health via the status LED (off = disconnected, solid = Wi-Fi only, blink = Wi-Fi + Redis).
 
-Example:
+## Room Configuration (`room:{id}:cfg`)
+
+The sender merges per-room JSON with the defaults in `config.h`, so you only need the fields that differ:
+
+- `baseline.brightness` – default percent (0–100) outside any special window.
+- `wake` – `{ "enabled": true, "hour": 7, "minute": 0, "duration_min": 20, "brightness": 100 }`. When enabled, the sender ramps from the baseline to `brightness` in `duration_min` minutes that end at the wake time.
+- `night` – `{ "enabled": true, "hour": 22, "minute": 0, "brightness": 5 }`. Once night starts the output is forced to `night.brightness` until the next wake window. The lead-in ramp length is governed by `QUIET_HOURS_DIM_MINUTES`.
+- `version` – optional integer tracked in logs and surfaced via the web API.
+
+Example payload:
 
 ```json
 {
   "version": 3,
-  "baseline": { "brightness": 0 },
-  "wake": { "enabled": true, "hour": 7, "minute": 0, "duration_min": 30, "brightness": 95 },
-  "night": { "enabled": true, "hour": 22, "minute": 0, "brightness": 8 }
+  "baseline": { "brightness": 10 },
+  "wake": { "enabled": true, "hour": 6, "minute": 30, "duration_min": 30, "brightness": 95 },
+  "night": { "enabled": true, "hour": 21, "minute": 0, "brightness": 8 }
 }
 ```
 
-## Redis Testing Snippets
+## Manual Override and Website Controls
 
-Run from any host with `redis-cli`:
+- Override state lives at `room:{id}:override` and has the shape:
+  ```json
+  { "enabled": true, "ver": 12, "updated_at": 1713309962000, "source": "website" }
+  ```
+- When override is enabled (either by the hardware button or the website) the sender switches to the potentiometer-selected brightness and streams that desired state continuously. Disabling override hands control back to the quiet-hours schedule.
+- The website exposes:
+  - Quiet-hours form (`POST /room/{id}/quiet-hours`) that rewrites `room:{id}:cfg` with the supplied wake/sleep pair (night brightness is forced to 0 for patient comfort).
+  - Manual override toggle (`POST /room/{id}/override`) that updates the override key with `source=website`.
+  - Instant brightness quick actions (`POST /room/{id}/brightness`) that write `room:{id}:desired` and append `cmd:room:{id}` packets for full-on or lights-out testing.
+- `GET /api/rooms/{id}` returns `{ room, schedule, quiet, override }`, which is useful for dashboards or scripts that need the merged defaults the sender will apply.
+
+## Redis Keys and Streams
+
+- `rooms:next_id` – monotonic counter used by the provisioning script (minimum `PROVISIONING_BASE_ID`).
+- `device:{mac}:room` / `room:{id}:device` – bidirectional map between hardware MAC addresses and room ids.
+- `room:{id}:cfg` – room schedule JSON (baseline/wake/night/version).
+- `room:{id}:desired` – last command published by the sender or the website.
+- `room:{id}:reported` – last state acknowledged after the receiver applied PWM.
+- `cmd:room:{id}` – command stream consumed by the receiver (trimmed to `~200` entries).
+- `state:room:{id}` – acknowledgement stream produced by the receiver (trimmed to `~200` entries).
+- `room:{id}:override` – manual override snapshot (enabled flag, version counter, last writer).
+- `room:{id}:online` – heartbeat key with TTL `contracts::kHeartbeatTtlSec` so operators can detect offline rooms quickly.
+
+## Useful `redis-cli` Snippets
 
 ```bash
-# Inspect the desired snapshot for room 101
+# Snapshot of the merged desired state
 redis-cli GET room:101:desired
 
-# Watch receiver acknowledgements
+# Watch incoming commands or receiver acknowledgements
+redis-cli XREAD BLOCK 0 STREAMS cmd:room:101 $
 redis-cli XREAD BLOCK 0 STREAMS state:room:101 $
 
-# Check heartbeats (key expires ~10 s after receiver loss)
+# Inspect quiet hours + override
+redis-cli GET room:101:cfg | jq .
+redis-cli GET room:101:override | jq .
+
+# Heartbeat (returns 1 while the receiver is online)
 redis-cli EXISTS room:101:online
 ```
 
+## Wiring Overview
+
+- **Sender control panel**
+  - Keep the USB/UART console accessible at `SENDER_CONSOLE_BAUD` so you can respond to `ROOM?` or read logs.
+  - Connect the override potentiometer to `OVERRIDE_POT_PIN` (default `A0`) and the toggle button to `OVERRIDE_BUTTON_PIN` (`INPUT_PULLUP`, active LOW by default). Tune `OVERRIDE_ANALOG_*` if your potentiometer range differs.
+  - Optional SSD1306 I²C display and status LED pins are configurable through the `SENDER_DISPLAY_*`/`SENDER_STATUS_LED_*` macros.
+- **Receiver LED driver**
+  - Drive a single MOSFET/transistor via `RECEIVER_LED_PIN` or enable RGB mixing by supplying `RECEIVER_LED_RED/GREEN/BLUE_PIN` plus per-channel mix percentages. Set `RECEIVER_LED_*_ACTIVE_LOW` when driving common-anode fixtures.
+  - `RECEIVER_STATUS_LED_PIN` mirrors Wi-Fi/Redis state; set to `-1` to disable or to `LED_BUILTIN` for quick bring-up.
+- **Networking**
+  - Both boards run in Wi-Fi STA mode on the same 2.4 GHz SSID. Keep them on an isolated lab VLAN when possible and ensure Redis is reachable from that subnet (open TCP 6379 or adjust `REDIS_PORT`).
+
 ## Operational Notes
 
-- Streams are trimmed to `~200` entries to bound memory as you scale to ~20 rooms.
-- Dynamic provisioning guarantees room ids >= `PROVISIONING_BASE_ID` (default 100) and seeds `room:{id}:desired` if missing.
-- The repo never hard-codes room ids; everything flows from the provisioning Lua script.
-- If Redis drops, both ESPs fall back to their last applied state and automatically resync once connectivity returns.
-
-For the detailed architecture requirements and acceptance criteria, see `docs/planning.md`.
+- Both command and state streams are trimmed to `~200` entries to cap Redis memory usage for ~20 rooms.
+- The provisioning script guarantees room ids ≥ `PROVISIONING_BASE_ID`, reseeds `room:{id}:desired` when missing, and records the MAC ↔ room mapping for later reuse.
+- Manual override versions monotonically increase so the website and hardware never fight—whoever writes last "wins" and the sender reconciles remote changes within ~2 seconds.
+- If Redis drops, each ESP falls back to its last known state and resynchronizes automatically once connectivity returns (including clock sync on the sender).
+- See `docs/planning.md` for the original requirements, acceptance criteria, and architectural deep dive.
