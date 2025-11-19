@@ -12,7 +12,13 @@ const appConfig = {
 };
 const STREAM_TRIM_LENGTH = 200;
 
+/**
+ * Tiny RESP client that speaks enough of the Redis protocol for this project.
+ */
 class RedisClient {
+  /**
+   * @param {{ host: string, port: number, password?: string }} options connection options
+   */
   constructor(options) {
     this.host = options.host;
     this.port = options.port;
@@ -25,6 +31,10 @@ class RedisClient {
     this.closed = false;
   }
 
+  /**
+   * Ensures there is an active TCP socket and performs AUTH when needed.
+   * @returns {Promise<void>}
+   */
   async ensureConnected() {
     if (this.closed) {
       throw new Error('Redis client closed');
@@ -66,6 +76,10 @@ class RedisClient {
     return this.connectPromise;
   }
 
+  /**
+   * Tears down the socket and rejects any pending command promises.
+   * @param {Error} [err]
+   */
   resetConnection(err) {
     this.ready = false;
     if (this.socket) {
@@ -76,11 +90,20 @@ class RedisClient {
     pending.forEach((waiter) => waiter.reject(err || new Error('Redis connection closed')));
   }
 
+  /**
+   * Sends a command after making sure the client is connected.
+   * @param {Array<string|Buffer>} args
+   * @returns {Promise<*>}
+   */
   async sendCommand(args) {
     await this.ensureConnected();
     return this.sendCommandInternal(args);
   }
 
+  /**
+   * Serializes a RESP command and resolves/rejects once the reply arrives.
+   * @param {Array<string|Buffer>} args
+   */
   sendCommandInternal(args) {
     if (!this.socket) {
       return Promise.reject(new Error('Redis socket unavailable'));
@@ -91,11 +114,18 @@ class RedisClient {
     });
   }
 
+  /**
+   * Appends new data to the buffer and tries to parse queued replies.
+   * @param {Buffer} chunk
+   */
   handleData(chunk) {
     this.buffer = Buffer.concat([this.buffer, chunk]);
     this.processBuffer();
   }
 
+  /**
+   * Attempts to parse RESP replies for every pending command in FIFO order.
+   */
   processBuffer() {
     while (this.queue.length) {
       const result = parseResp(this.buffer, 0);
@@ -112,14 +142,24 @@ class RedisClient {
     }
   }
 
+  /**
+   * Issues `GET key`.
+   * @param {string} key
+   */
   async get(key) {
     return this.sendCommand(['GET', key]);
   }
 
+  /**
+   * Issues `SET key value`.
+   * @param {string} key
+   * @param {string} value
+   */
   async set(key, value) {
     return this.sendCommand(['SET', key, value]);
   }
 
+  /** Gracefully shuts down the socket and rejects future commands. */
   close() {
     this.closed = true;
     if (this.socket) {
@@ -129,6 +169,11 @@ class RedisClient {
   }
 }
 
+/**
+ * Encodes an array of strings/buffers into a RESP bulk command.
+ * @param {Array<string|Buffer>} parts
+ * @returns {Buffer}
+ */
 function encodeCommand(parts) {
   const buffers = [];
   buffers.push(Buffer.from(`*${parts.length}\r\n`));
@@ -141,6 +186,12 @@ function encodeCommand(parts) {
   return Buffer.concat(buffers);
 }
 
+/**
+ * Parses a RESP value from the supplied buffer starting at offset.
+ * @param {Buffer} buffer
+ * @param {number} offset
+ * @returns {{ value?: *, error?: Error, nextOffset: number }|null}
+ */
 function parseResp(buffer, offset = 0) {
   if (!buffer || offset >= buffer.length) {
     return null;
@@ -162,6 +213,12 @@ function parseResp(buffer, offset = 0) {
   }
 }
 
+/**
+ * Reads a CRLF-terminated ASCII line from the buffer.
+ * @param {Buffer} buffer
+ * @param {number} start
+ * @returns {{ line: string, nextOffset: number }|null}
+ */
 function readLine(buffer, start) {
   const end = buffer.indexOf('\r\n', start);
   if (end === -1) {
@@ -170,6 +227,7 @@ function readLine(buffer, start) {
   return { line: buffer.toString('utf8', start, end), nextOffset: end + 2 };
 }
 
+/** Parses a +OK style RESP simple string. */
 function parseSimpleString(buffer, offset) {
   const result = readLine(buffer, offset + 1);
   if (!result) {
@@ -178,6 +236,7 @@ function parseSimpleString(buffer, offset) {
   return { value: result.line, nextOffset: result.nextOffset };
 }
 
+/** Parses a -ERR style RESP error. */
 function parseError(buffer, offset) {
   const result = readLine(buffer, offset + 1);
   if (!result) {
@@ -186,6 +245,7 @@ function parseError(buffer, offset) {
   return { error: new Error(result.line), nextOffset: result.nextOffset };
 }
 
+/** Parses a :123 style RESP integer. */
 function parseInteger(buffer, offset) {
   const result = readLine(buffer, offset + 1);
   if (!result) {
@@ -194,6 +254,7 @@ function parseInteger(buffer, offset) {
   return { value: Number(result.line), nextOffset: result.nextOffset };
 }
 
+/** Parses a $N style RESP bulk string with inline length handling. */
 function parseBulkString(buffer, offset) {
   const header = readLine(buffer, offset + 1);
   if (!header) {
@@ -214,6 +275,7 @@ function parseBulkString(buffer, offset) {
   return { value, nextOffset: end + 2 };
 }
 
+/** Parses a *N style RESP array and returns the nested JS representation. */
 function parseArray(buffer, offset) {
   const header = readLine(buffer, offset + 1);
   if (!header) {
@@ -254,10 +316,19 @@ const DEFAULT_DESIRED_STATE = Object.freeze({
   ver: 0
 });
 
+/**
+ * Performs a cheap deep clone by encoding/decoding JSON.
+ * @param {*} value
+ */
 function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+/**
+ * Merges stored schedule JSON with defaults so downstream code can rely on fields.
+ * @param {*} source
+ * @returns {object}
+ */
 function ensureScheduleShape(source) {
   const cfg = typeof source === 'object' && source ? { ...source } : {};
   cfg.baseline = { ...DEFAULT_SCHEDULE.baseline, ...(cfg.baseline || {}) };
@@ -273,6 +344,10 @@ function ensureScheduleShape(source) {
   return cfg;
 }
 
+/**
+ * Parses the quiet-hour schedule while falling back to defaults on invalid JSON.
+ * @param {string} payload
+ */
 function readSchedulePayload(payload) {
   if (!payload) {
     return ensureScheduleShape({});
@@ -286,6 +361,7 @@ function readSchedulePayload(payload) {
   }
 }
 
+/** Formats 24-hour hour/minute integers into HH:MM strings. */
 function formatTime(hour, minute) {
   const h = Number(hour) || 0;
   const m = Number(minute) || 0;
@@ -294,6 +370,9 @@ function formatTime(hour, minute) {
   return `${hh}:${mm}`;
 }
 
+/**
+ * Validates HH:MM inputs from forms and returns `{ hour, minute }` or null.
+ */
 function parseTimeInput(value) {
   if (typeof value !== 'string' || !/^\d{2}:\d{2}$/.test(value)) {
     return null;
@@ -314,6 +393,7 @@ function parseTimeInput(value) {
   return { hour, minute };
 }
 
+/** Formats a JS Date into a compact human-friendly timestamp string. */
 function formatDateTime(date) {
   if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
     return '';
@@ -327,6 +407,7 @@ function formatDateTime(date) {
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
+/** Formats a number with the requested decimal precision or returns null. */
 function formatNumber(value, fractionDigits = 0) {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     return null;
@@ -334,6 +415,7 @@ function formatNumber(value, fractionDigits = 0) {
   return value.toFixed(fractionDigits);
 }
 
+/** Clamps brightness values to the 0-100 range. */
 function clampBrightness(value) {
   const num = Number(value);
   if (Number.isNaN(num) || num <= 0) {
@@ -345,6 +427,9 @@ function clampBrightness(value) {
   return Math.round(num);
 }
 
+/**
+ * Parses the stored Desired snapshot, falling back to safe defaults.
+ */
 function readDesiredPayload(payload) {
   if (!payload) {
     return deepClone(DEFAULT_DESIRED_STATE);
@@ -364,6 +449,9 @@ function readDesiredPayload(payload) {
   }
 }
 
+/**
+ * Parses the quiet-hour warning JSON stored by the receiver.
+ */
 function readWarningPayload(payload) {
   if (!payload) {
     return null;
@@ -397,23 +485,29 @@ function readWarningPayload(payload) {
   }
 }
 
+/** Returns `{ sleep, wake }` strings derived from the schedule payload. */
 function quietTimesFromSchedule(schedule) {
   const sleep = formatTime(schedule.night.hour, schedule.night.minute);
   const wake = formatTime(schedule.wake.hour, schedule.wake.minute);
   return { sleep, wake };
 }
 
+/**
+ * Loads the quiet-hour configuration JSON for the requested room.
+ */
 async function loadSchedule(roomId) {
   const key = roomConfigKey(roomId);
   const payload = await redis.get(key);
   return readSchedulePayload(payload);
 }
 
+/** Pulls the most recent quiet-hour sound warning for the room. */
 async function loadLatestWarning(roomId) {
   const payload = await redis.get(roomWarningKey(roomId));
   return readWarningPayload(payload);
 }
 
+/** Persists the merged schedule JSON back to Redis. */
 async function saveSchedule(roomId, schedule) {
   const key = roomConfigKey(roomId);
   if (schedule && Object.prototype.hasOwnProperty.call(schedule, 'cfg_ver')) {
@@ -423,26 +517,34 @@ async function saveSchedule(roomId, schedule) {
   await redis.set(key, serialized);
 }
 
+/** Helper for `room:{id}:cfg`. */
 function roomConfigKey(roomId) {
   return `room:${roomId}:cfg`;
 }
 
+/** Helper for `room:{id}:override`. */
 function roomOverrideKey(roomId) {
   return `room:${roomId}:override`;
 }
 
+/** Helper for `room:{id}:desired`. */
 function roomDesiredKey(roomId) {
   return `room:${roomId}:desired`;
 }
 
+/** Helper for `cmd:room:{id}`. */
 function roomCommandStream(roomId) {
   return `cmd:room:${roomId}`;
 }
 
+/** Helper for `room:{id}:latest_warning`. */
 function roomWarningKey(roomId) {
   return `room:${roomId}:latest_warning`;
 }
 
+/**
+ * Reads the override snapshot or returns a default placeholder.
+ */
 async function getOverrideState(roomId) {
   const payload = await redis.get(roomOverrideKey(roomId));
   if (!payload) {
@@ -462,6 +564,9 @@ async function getOverrideState(roomId) {
   }
 }
 
+/**
+ * Increments the override version and records the latest change in Redis.
+ */
 async function setOverrideState(roomId, enabled, source = 'website') {
   const current = await getOverrideState(roomId);
   const next = {
@@ -474,6 +579,9 @@ async function setOverrideState(roomId, enabled, source = 'website') {
   return next;
 }
 
+/**
+ * Rewrites the desired snapshot and emits a command stream entry immediately.
+ */
 async function sendBrightnessCommand(roomId, brightness, source = 'website') {
   const clamped = clampBrightness(brightness);
   const desiredKey = roomDesiredKey(roomId);
@@ -501,6 +609,7 @@ async function sendBrightnessCommand(roomId, brightness, source = 'website') {
   return desired;
 }
 
+/** Loads schedule, override, and warning payloads in parallel for UI rendering. */
 async function loadRoomState(roomId) {
   const [schedule, override, warning] =
       await Promise.all([loadSchedule(roomId), getOverrideState(roomId), loadLatestWarning(roomId)]);
@@ -508,6 +617,9 @@ async function loadRoomState(roomId) {
   return { schedule, quiet, override, warning };
 }
 
+/**
+ * Buffers the request body up to a sane limit before resolving with a UTF-8 string.
+ */
 async function readRequestBody(req, limitBytes = 4096) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -528,6 +640,7 @@ async function readRequestBody(req, limitBytes = 4096) {
   });
 }
 
+/** Escapes minimal HTML entities so UI rendering stays safe. */
 function htmlEscape(value) {
   return String(value)
       .replace(/&/g, '&amp;')
@@ -537,6 +650,7 @@ function htmlEscape(value) {
       .replace(/'/g, '&#39;');
 }
 
+/** Maps status query params into inline alert text. */
 function renderStatusMessage(code) {
   switch (code) {
     case 'quiet-updated':
@@ -554,6 +668,7 @@ function renderStatusMessage(code) {
   }
 }
 
+/** Normalizes acceptable fragment identifiers for redirects. */
 function sanitizeFragment(value) {
   if (typeof value !== 'string') {
     return '';
@@ -565,6 +680,7 @@ function sanitizeFragment(value) {
   return trimmed;
 }
 
+/** Builds the `/room/{id}` redirect URL used after POST handling. */
 function roomRedirectLocation(roomId, statusCode, anchor) {
   const base = `/room/${encodeURIComponent(roomId)}`;
   const query = statusCode ? `?status=${encodeURIComponent(statusCode)}` : '';
@@ -573,6 +689,7 @@ function roomRedirectLocation(roomId, statusCode, anchor) {
   return `${base}${query}${hash}`;
 }
 
+/** Server-side renders the quiet-hour warning card content. */
 function renderWarningCard(warning) {
   if (!warning) {
     return '<p>No quiet-hour sound warnings have been recorded.</p>';
@@ -594,6 +711,7 @@ function renderWarningCard(warning) {
   </div>`;
 }
 
+/** Returns the complete HTML document for the room view. */
 function renderRoomPage(roomId, state, statusCode) {
   const message = renderStatusMessage(statusCode);
   const overrideLabel = state.override.enabled ? 'enabled' : 'disabled';
@@ -684,6 +802,7 @@ function renderRoomPage(roomId, state, statusCode) {
 </html>`;
 }
 
+/** Returns the landing page HTML with the room lookup form. */
 function renderIndexPage() {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -710,6 +829,7 @@ function renderIndexPage() {
 </html>`;
 }
 
+/** Parses `/room/{id}` and optional action suffixes. */
 function matchRoomRoute(pathname) {
   const match = pathname.match(/^\/room\/([^/]+)(?:\/(quiet-hours|override|brightness))?\/?$/);
   if (!match) {
@@ -722,6 +842,7 @@ function matchRoomRoute(pathname) {
   return { roomId, action: match[2] || null };
 }
 
+/** Parses `/api/rooms/{id}` and enforces room id validations. */
 function matchApiRoute(pathname) {
   const match = pathname.match(/^\/api\/rooms\/([^/]+)\/?$/);
   if (!match) {
@@ -734,10 +855,12 @@ function matchApiRoute(pathname) {
   return { roomId };
 }
 
+/** Returns true when a given room id string is syntactically valid. */
 function isValidRoomId(value) {
   return typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(value);
 }
 
+/** Primary HTTP request handler for UI, API, and health checks. */
 async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = url.pathname;

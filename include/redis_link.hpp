@@ -13,13 +13,21 @@
  */
 class RedisLink {
  public:
+  /**
+   * Constructs a RedisLink that will operate over the provided Client implementation.
+   */
   explicit RedisLink(Client &client) : client_(client) {
     lineBuffer_.reserve(64);
   }
 
+  /** Returns true when the underlying TCP client is still connected. */
   bool connected() const { return client_.connected(); }
+  /** Immediately closes the underlying connection. */
   void stop() { client_.stop(); }
 
+  /**
+   * Updates the read timeout (milliseconds) used by blocking RESP operations.
+   */
   void setTimeout(uint16_t ms) {
     timeoutMs_ = ms;
 #ifdef ARDUINO
@@ -27,6 +35,9 @@ class RedisLink {
 #endif
   }
 
+  /**
+   * Issues an `AUTH` command when a password is provided, returning true on success.
+   */
   bool auth(const char *password) {
     if (!password || !password[0]) {
       return true;
@@ -34,12 +45,19 @@ class RedisLink {
     return sendSimpleStatus({"AUTH", password});
   }
 
+  /** Sends a `PING` round-trip to verify liveness. */
   bool ping() { return sendSimpleStatus({"PING"}); }
 
+  /**
+   * Executes `SET key value` to overwrite a Redis string.
+   */
   bool set(const String &key, const String &value) {
     return sendSimpleStatus({RedisArg("SET"), RedisArg(key), RedisArg(value)});
   }
 
+  /**
+   * Executes `GET key` and stores the response. When `isNull` is supplied it reports nil replies.
+   */
   bool get(const String &key, String &out, bool *isNull = nullptr) {
     if (!sendCommand({RedisArg("GET"), RedisArg(key)})) {
       return false;
@@ -47,12 +65,16 @@ class RedisLink {
     return readBulkString(out, isNull);
   }
 
+  /** Sets an expire TTL (seconds) for the given key. */
   bool expire(const String &key, uint16_t ttlSec) {
     char ttl[6];
     snprintf(ttl, sizeof(ttl), "%u", ttlSec);
     return sendIntegerEqualsOne({RedisArg("EXPIRE"), RedisArg(key), RedisArg(ttl)});
   }
 
+  /**
+   * Runs the provisioning Lua script and returns the allocated room id for the device.
+   */
   bool evalRoomScript(const __FlashStringHelper *script,
                       const String &deviceId,
                       uint16_t baseId,
@@ -65,16 +87,26 @@ class RedisLink {
     return readBulkString(roomId);
   }
 
+  /**
+   * Appends a JSON payload to the provided stream with the field name `p`.
+   */
   bool xaddJson(const String &stream, const String &payload) {
     return sendBulkOnly({RedisArg("XADD"), RedisArg(stream), RedisArg("*"), RedisArg("p"), RedisArg(payload)});
   }
 
+  /**
+   * Soft-trims a stream (`XTRIM MAXLEN ~`) to bound Redis memory usage.
+   */
   bool xtrimApprox(const String &stream, uint16_t maxLen) {
     char lenStr[8];
     snprintf(lenStr, sizeof(lenStr), "%u", maxLen);
     return sendIntegerConsume({RedisArg("XTRIM"), RedisArg(stream), RedisArg("MAXLEN"), RedisArg("~"), RedisArg(lenStr)});
   }
 
+  /**
+   * Performs an `XREAD` from `stream`, blocking for up to `blockMs` until a new entry appears.
+   * Stores the record id and payload when a command is delivered.
+   */
   bool xreadLatest(const String &stream,
                    uint16_t blockMs,
                    const String &sinceId,
@@ -96,6 +128,9 @@ class RedisLink {
     return readXreadPayload(entryId, payload);
   }
 
+  /**
+   * Reads the latest stream entry id using `XREVRANGE` so consumers can resume at the tail.
+   */
   bool streamTailId(const String &stream, String &entryId) {
     if (!sendCommand({RedisArg("XREVRANGE"),
                       RedisArg(stream),
@@ -108,15 +143,22 @@ class RedisLink {
     return readXrevrangeTail(entryId);
   }
 
+  /**
+   * Writes a simple heartbeat key with an `EX` TTL so monitoring can detect offline devices.
+   */
   bool setHeartbeat(const String &key, uint16_t ttlSec) {
     char ttl[6];
     snprintf(ttl, sizeof(ttl), "%u", ttlSec);
     return sendSimpleStatus({RedisArg("SET"), RedisArg(key), RedisArg("1"), RedisArg("EX"), RedisArg(ttl)});
   }
 
+  /** Holds the last Redis protocol error string for debugging. */
   const String &lastError() const { return lastError_; }
 
  private:
+  /**
+   * Simple view into the argument bytes for RESP serialization.
+   */
   struct RedisArg {
     const uint8_t *data;
     size_t len;
@@ -141,6 +183,9 @@ class RedisLink {
   String lastError_;
   uint16_t timeoutMs_ = 1500;
 
+  /**
+   * Serializes and writes a RESP command made up of the provided argument list.
+   */
   bool sendCommand(std::initializer_list<RedisArg> args) {
     lastError_.remove(0);
     if (!connected()) {
@@ -170,6 +215,9 @@ class RedisLink {
     return true;
   }
 
+  /**
+   * Sends a command that should return a simple status reply (e.g. `+OK`).
+   */
   bool sendSimpleStatus(std::initializer_list<RedisArg> args) {
     if (!sendCommand(args)) {
       return false;
@@ -177,15 +225,24 @@ class RedisLink {
     return readSimpleStatus();
   }
 
+  /**
+   * Sends a command that returns `:1` on success and checks the integer response.
+   */
   bool sendIntegerEqualsOne(std::initializer_list<RedisArg> args) {
     long value = 0;
     return sendIntegerCommand(args, &value) && value == 1;
   }
 
+  /**
+   * Sends a command while discarding the integer response.
+   */
   bool sendIntegerConsume(std::initializer_list<RedisArg> args) {
     return sendIntegerCommand(args, nullptr);
   }
 
+  /**
+   * Sends a command that returns an integer and optionally stores the parsed value.
+   */
   bool sendIntegerCommand(std::initializer_list<RedisArg> args, long *out) {
     if (!sendCommand(args)) {
       return false;
@@ -200,6 +257,9 @@ class RedisLink {
     return true;
   }
 
+  /**
+   * Issues a command and consumes the bulk-string response without keeping it.
+   */
   bool sendBulkOnly(std::initializer_list<RedisArg> args) {
     if (!sendCommand(args)) {
       return false;
@@ -208,6 +268,9 @@ class RedisLink {
     return readBulkString(tmp);
   }
 
+  /**
+   * Reads a simple status line (`+OK` or `-ERR`) after issuing a command.
+   */
   bool readSimpleStatus() {
     char type;
     if (!readType(type, lineBuffer_)) {
@@ -222,6 +285,9 @@ class RedisLink {
     return false;
   }
 
+  /**
+   * Reads an integer reply (`:1234`) and stores the value when available.
+   */
   bool readInteger(long &value) {
     char type;
     if (!readType(type, lineBuffer_)) {
@@ -237,6 +303,9 @@ class RedisLink {
     return false;
   }
 
+  /**
+   * Reads a bulk-string reply into `out`, optionally reporting when the server returned nil.
+   */
   bool readBulkString(String &out, bool *isNull = nullptr) {
     char type;
     if (!readType(type, lineBuffer_)) {
@@ -279,6 +348,9 @@ class RedisLink {
     return false;
   }
 
+  /**
+   * Parses an array length header (`*N`) from the stream.
+   */
   bool readArrayLen(int &len) {
     char type;
     if (!readType(type, lineBuffer_)) {
@@ -294,6 +366,9 @@ class RedisLink {
     return false;
   }
 
+  /**
+   * Reads the RESP type byte and line payload, handling connection errors/timeouts.
+   */
   bool readType(char &type, String &line) {
     if (!connected()) {
       lastError_ = F("redis disconnected");
@@ -324,12 +399,16 @@ class RedisLink {
     return true;
   }
 
+  /** Consumes the CRLF that terminates bulk-string payloads. */
   bool consumeCrlf() {
     char buf[2];
     size_t got = client_.readBytes(buf, sizeof(buf));
     return got == sizeof(buf) && buf[0] == '\r' && buf[1] == '\n';
   }
 
+  /**
+   * Parses the nested array reply returned by `XREAD` to extract the `p` field payload.
+   */
   bool readXreadPayload(String &entryIdOut, String &payload) {
     int topCount = 0;
     if (!readArrayLen(topCount)) {
@@ -385,6 +464,9 @@ class RedisLink {
     return false;
   }
 
+  /**
+   * Parses the latest entry id returned by `XREVRANGE stream + - COUNT 1`.
+   */
   bool readXrevrangeTail(String &entryId) {
     int entryCount = 0;
     if (!readArrayLen(entryCount)) {

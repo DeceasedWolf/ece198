@@ -205,6 +205,9 @@ constexpr size_t kWarningJsonCapacity = 320;
 constexpr uint32_t kWarningFreshWindowSec = 90;
 constexpr unsigned long kWarningTimeGateMs = 8000;
 
+/**
+ * Cached content for the optional SSD1306 status screen.
+ */
 struct DisplayPayload {
   char current[12]{};
   char quietStart[12]{};
@@ -215,6 +218,9 @@ struct DisplayPayload {
 };
 
 DisplayPayload lastDisplayPayload{};
+/**
+ * Latest quiet-hour sound warning published by the receiver.
+ */
 struct SoundWarningState {
   uint32_t capturedAt = 0;
   float decibels = 0.0f;
@@ -231,6 +237,9 @@ String warningFetchJson;
 HardwareSerial &consoleSerial = Serial;
 HardwareSerial &logSerial = Serial;
 
+/**
+ * Simple exponential-ish backoff helper shared by Wi-Fi/Redis reconnection loops.
+ */
 struct Backoff {
   unsigned long nextMs = 0;
   uint8_t slot = 0;
@@ -266,6 +275,9 @@ bool desiredForcePublish = false;
 bool acquireLocalTime(tm &out);
 bool timeIsValid();
 
+/**
+ * Snapshot of the manual override hardware inputs (button + potentiometer).
+ */
 struct OverrideState {
   bool enabled = false;
   bool buttonStable = false;
@@ -277,6 +289,9 @@ struct OverrideState {
 
 OverrideState overrideState;
 
+/**
+ * Tracks metadata fetched from Redis so device + website updates remain monotonic.
+ */
 struct OverrideMirror {
   bool known = false;
   bool enabled = false;
@@ -292,6 +307,9 @@ bool statusLedBlinkState = true;
 int8_t statusLedAppliedState = -1;
 unsigned long statusLedLastToggleMs = 0;
 
+/**
+ * Cached quiet-hours schedule pulled from Redis.
+ */
 struct RoomSchedule {
   bool wakeEnabled = true;
   uint16_t wakeStartMin = static_cast<uint16_t>(SCHEDULE_DEFAULT_WAKE_HOUR * 60 +
@@ -316,6 +334,9 @@ bool timeAnnounced = false;
 unsigned long lastTimeSyncAttemptMs = 0;
 
 #if SENDER_DISPLAY_ENABLED
+/**
+ * Writes a placeholder string when the real clock is unavailable.
+ */
 void writeTimePlaceholder(char *dst, size_t len) {
   if (!len) {
     return;
@@ -324,6 +345,9 @@ void writeTimePlaceholder(char *dst, size_t len) {
   std::snprintf(dst, len, "%s", kPlaceholder);
 }
 
+/**
+ * Formats minutes-after-midnight into HH:MM AM/PM text.
+ */
 void formatMinutes12(uint16_t minutes, char *dst, size_t len) {
   if (!len) {
     return;
@@ -339,11 +363,17 @@ void formatMinutes12(uint16_t minutes, char *dst, size_t len) {
   std::snprintf(dst, len, "%02u:%02u %s", hour12, minute, suffix);
 }
 
+/**
+ * Converts the current localtime snapshot into the display-friendly string.
+ */
 void formatCurrentTime(const tm &now, char *dst, size_t len) {
   uint16_t minutes = static_cast<uint16_t>(((now.tm_hour % 24) * 60) + now.tm_min);
   formatMinutes12(minutes, dst, len);
 }
 
+/**
+ * Compares display payloads so we only redraw when values actually change.
+ */
 bool payloadChanged(const DisplayPayload &a, const DisplayPayload &b) {
   if (a.timeValid != b.timeValid || a.quietEnabled != b.quietEnabled ||
       a.warningActive != b.warningActive) {
@@ -361,6 +391,9 @@ bool payloadChanged(const DisplayPayload &a, const DisplayPayload &b) {
   return false;
 }
 
+/**
+ * Draws either the warning overlay or the quiet-hours summary on the SSD1306.
+ */
 void renderDisplay(const DisplayPayload &payload) {
   if (!displayReady) {
     return;
@@ -389,6 +422,9 @@ void renderDisplay(const DisplayPayload &payload) {
   senderDisplay.display();
 }
 
+/**
+ * Builds the text that should appear on the screen based on time/schedule state.
+ */
 void composeDisplayPayload(DisplayPayload &payload) {
   unsigned long nowMs = millis();
   if (warningOverlayUntilMs > 0) {
@@ -414,6 +450,9 @@ void composeDisplayPayload(DisplayPayload &payload) {
   }
 }
 
+/**
+ * Initializes the optional SSD1306 display and renders a boot banner.
+ */
 void initDisplayHardware() {
   if (displayReady) {
     return;
@@ -433,6 +472,9 @@ void initDisplayHardware() {
   lastDisplayPayload = DisplayPayload();
 }
 
+/**
+ * Refreshes the display at a fixed cadence when the payload changed.
+ */
 void maybeUpdateDisplay(unsigned long now) {
   if (!displayReady) {
     return;
@@ -450,6 +492,9 @@ void maybeUpdateDisplay(unsigned long now) {
   lastDisplayPayload = payload;
 }
 
+/**
+ * Parses the quiet-hour warning JSON provided by the receiver.
+ */
 bool decodeWarningJson(const String &payload, SoundWarningState &out) {
   StaticJsonDocument<kWarningJsonCapacity> doc;
   DeserializationError err = deserializeJson(doc, payload);
@@ -468,6 +513,9 @@ bool decodeWarningJson(const String &payload, SoundWarningState &out) {
   return true;
 }
 
+/**
+ * Reports whether a warning is recent enough to alert the nurse panel.
+ */
 bool warningIsFresh(const SoundWarningState &state) {
   if (!timeIsValid()) {
     return true;
@@ -480,6 +528,9 @@ bool warningIsFresh(const SoundWarningState &state) {
   return age <= kWarningFreshWindowSec;
 }
 
+/**
+ * Polls Redis for the latest sound warning and toggles the display overlay.
+ */
 void maybeFetchLatestWarning(unsigned long now) {
   if (!roomId.length() || !redis.connected()) {
     return;
@@ -537,11 +588,17 @@ char consoleBuffer[kConsoleMaxBytes]{};
 size_t consoleLen = 0;
 unsigned long consoleLastByteMs = 0;
 
+/**
+ * Convenience wrapper for emitting tagged log lines.
+ */
 void log(const __FlashStringHelper *msg) {
   logSerial.print(F("[sender] "));
   logSerial.println(msg);
 }
 
+/**
+ * Prints the most recent Redis protocol error with some context.
+ */
 void logRedisFailure(const __FlashStringHelper *where) {
   logSerial.print(F("[redis] "));
   logSerial.print(where);
@@ -549,6 +606,9 @@ void logRedisFailure(const __FlashStringHelper *where) {
   logSerial.println(redis.lastError());
 }
 
+/**
+ * Applies the requested state to the optional connectivity status LED.
+ */
 void setStatusLed(bool on) {
   if (!kStatusLedControllable) {
     return;
@@ -562,6 +622,9 @@ void setStatusLed(bool on) {
   digitalWrite(static_cast<uint8_t>(kStatusLedPin), levelHigh ? HIGH : LOW);
 }
 
+/**
+ * Drives the status LED blink/solid/off patterns based on Wi-Fi/Redis health.
+ */
 void updateStatusLed(unsigned long now) {
   if (!kStatusLedControllable) {
     return;
@@ -594,6 +657,9 @@ void updateStatusLed(unsigned long now) {
   }
 }
 
+/**
+ * Clears cached schedule/override state so the next Redis sync starts fresh.
+ */
 void resetState() {
   localVer = 0;
   needsVersionSeed = true;
@@ -613,12 +679,18 @@ void resetState() {
 #endif
 }
 
+/**
+ * Logs the Redis failure, tears down the link, and resets derived state.
+ */
 void dropRedis(const __FlashStringHelper *context) {
   logRedisFailure(context);
   redis.stop();
   resetState();
 }
 
+/**
+ * Performs a blocking Wi-Fi connect loop until STA mode is online.
+ */
 void connectWifiBlocking() {
   logSerial.print(F("[wifi] connecting to "));
   logSerial.println(WIFI_SSID);
@@ -645,6 +717,9 @@ void connectWifiBlocking() {
   logSerial.println(WiFi.RSSI());
 }
 
+/**
+ * Keeps Wi-Fi online, reconnecting synchronously when needed.
+ */
 bool ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiBackoff.reset();
@@ -655,6 +730,9 @@ bool ensureWifi() {
   return WiFi.status() == WL_CONNECTED;
 }
 
+/**
+ * Maintains the Redis TCP connection, authenticating and pinging before use.
+ */
 bool ensureRedis() {
   if (redis.connected()) {
     redisBackoff.reset();
@@ -690,6 +768,9 @@ bool ensureRedis() {
   return true;
 }
 
+/**
+ * Accepts `ROOM:<id>` console input and resets local state when the id changes.
+ */
 void handleRoomAnnouncement(const char *payload) {
   String rid = payload;
   rid.trim();
@@ -704,6 +785,9 @@ void handleRoomAnnouncement(const char *payload) {
   }
 }
 
+/**
+ * Constrains integer percentages to the 0-100 range.
+ */
 uint8_t clampPercent(int value) {
   if (value < 0) {
     return 0;
@@ -714,6 +798,9 @@ uint8_t clampPercent(int value) {
   return static_cast<uint8_t>(value);
 }
 
+/**
+ * Converts hour/minute pairs into minutes since midnight (clamped).
+ */
 uint16_t minuteOfDay(int hour, int minute) {
   if (hour < 0) {
     hour = 0;
@@ -728,6 +815,9 @@ uint16_t minuteOfDay(int hour, int minute) {
   return static_cast<uint16_t>(hour * 60 + minute);
 }
 
+/**
+ * Constrains durations to a single day so ramps do not overflow.
+ */
 uint16_t clampDurationMinutes(int value) {
   if (value < 0) {
     return 0;
@@ -738,6 +828,9 @@ uint16_t clampDurationMinutes(int value) {
   return static_cast<uint16_t>(value);
 }
 
+/**
+ * Normalizes button readings so logic stays agnostic to HIGH/LOW active levels.
+ */
 bool overrideButtonPressedLevel(int level) {
   if (OVERRIDE_BUTTON_ACTIVE_LEVEL == LOW) {
     return level == LOW;
@@ -745,6 +838,7 @@ bool overrideButtonPressedLevel(int level) {
   return level == HIGH;
 }
 
+/** Prints the override enable state + brightness for debugging. */
 void logOverrideState() {
   logSerial.print(F("[override] "));
   logSerial.print(overrideState.enabled ? F("enabled ") : F("disabled "));
@@ -753,6 +847,9 @@ void logOverrideState() {
   logSerial.println('%');
 }
 
+/**
+ * Converts the potentiometer ADC reading into a linear 0-100% value.
+ */
 uint8_t analogToPercent(uint16_t raw) {
   uint16_t clamped = raw;
   if (clamped < kOverrideAnalogMin) {
@@ -766,6 +863,9 @@ uint8_t analogToPercent(uint16_t raw) {
   return static_cast<uint8_t>(scaled / span);
 }
 
+/**
+ * Switches override mode locally and marks the Redis shadow as dirty.
+ */
 void setOverrideEnabled(bool enabled, bool syncToRedis = true) {
   if (overrideState.enabled == enabled) {
     return;
@@ -779,8 +879,12 @@ void setOverrideEnabled(bool enabled, bool syncToRedis = true) {
   logOverrideState();
 }
 
+/** Convenience helper for flipping override state after a button press. */
 void toggleOverride() { setOverrideEnabled(!overrideState.enabled, true); }
 
+/**
+ * Debounces the override button and toggles override when a press is detected.
+ */
 void pollOverrideButton(unsigned long now) {
   bool pressed = overrideButtonPressedLevel(digitalRead(OVERRIDE_BUTTON_PIN));
   if (pressed != overrideState.buttonReading) {
@@ -800,6 +904,9 @@ void pollOverrideButton(unsigned long now) {
   }
 }
 
+/**
+ * Samples the potentiometer and requests a publish when brightness shifts.
+ */
 void pollOverrideAnalog() {
   uint16_t raw = analogRead(OVERRIDE_POT_PIN);
   overrideState.lastAnalogRaw = raw;
@@ -815,6 +922,9 @@ void pollOverrideAnalog() {
   }
 }
 
+/**
+ * Configures the button/potentiometer pins and warms up cached readings.
+ */
 void initOverrideHardware() {
   pinMode(OVERRIDE_BUTTON_PIN, OVERRIDE_BUTTON_PIN_MODE);
   overrideState.buttonStable = overrideButtonPressedLevel(digitalRead(OVERRIDE_BUTTON_PIN));
@@ -825,11 +935,15 @@ void initOverrideHardware() {
   logOverrideState();
 }
 
+/** Polls both override inputs each loop iteration. */
 void pumpOverrideInputs(unsigned long now) {
   pollOverrideButton(now);
   pollOverrideAnalog();
 }
 
+/**
+ * Parses the override snapshot stored in Redis.
+ */
 bool decodeOverrideJson(const String &json, bool &enabled, uint32_t &version) {
   if (!json.length()) {
     return false;
@@ -856,6 +970,9 @@ bool decodeOverrideJson(const String &json, bool &enabled, uint32_t &version) {
 
 bool timeIsValid();
 
+/**
+ * Returns an epoch timestamp when SNTP is synced or falls back to millis().
+ */
 uint32_t overrideTimestamp() {
   if (timeIsValid()) {
     time_t now = time(nullptr);
@@ -866,6 +983,9 @@ uint32_t overrideTimestamp() {
   return static_cast<uint32_t>(millis());
 }
 
+/**
+ * Periodically refreshes the override snapshot from Redis and applies remote toggles.
+ */
 void maybeFetchOverrideState(unsigned long now) {
   if (!roomId.length() || !redis.connected()) {
     return;
@@ -901,6 +1021,9 @@ void maybeFetchOverrideState(unsigned long now) {
   }
 }
 
+/**
+ * Writes the latest override snapshot to Redis whenever we have local changes.
+ */
 void maybePublishOverrideState() {
   if (!overrideDirty || !roomId.length() || !redis.connected()) {
     return;
@@ -932,6 +1055,9 @@ void maybePublishOverrideState() {
   logSerial.println(newVer);
 }
 
+/**
+ * Parses the stored quiet-hour schedule JSON into the strongly-typed struct.
+ */
 bool decodeScheduleJson(const String &json, RoomSchedule &out) {
   StaticJsonDocument<384> doc;
   DeserializationError err = deserializeJson(doc, json);
@@ -973,6 +1099,9 @@ bool decodeScheduleJson(const String &json, RoomSchedule &out) {
   return true;
 }
 
+/**
+ * Emits the current schedule configuration to the console for debugging.
+ */
 void logScheduleSummary() {
   logSerial.print(F("[schedule] baseline="));
   logSerial.print(scheduleCfg.baselineBrightness);
@@ -1007,6 +1136,9 @@ void logScheduleSummary() {
   logSerial.println(scheduleCfg.version);
 }
 
+/**
+ * Loads the latest quiet-hours/sunrise config for the current room.
+ */
 bool fetchScheduleConfig() {
   if (!roomId.length()) {
     return false;
@@ -1036,8 +1168,12 @@ bool fetchScheduleConfig() {
   return true;
 }
 
+/** Resets the console input buffer after a command completes. */
 void flushConsoleBuffer() { consoleLen = 0; }
 
+/**
+ * Handles interactive console commands such as ROOM assignment or CFG dumps.
+ */
 void handleConsoleLine(const char *line) {
   if (!line || !line[0]) {
     return;
@@ -1064,6 +1200,9 @@ void handleConsoleLine(const char *line) {
   logSerial.println(line);
 }
 
+/**
+ * Non-blocking UART console processor that tokenizes CRLF-delimited commands.
+ */
 void pumpConsole() {
   while (consoleSerial.available()) {
     char c = static_cast<char>(consoleSerial.read());
@@ -1089,6 +1228,9 @@ void pumpConsole() {
   }
 }
 
+/**
+ * Periodically prompts the operator for a ROOM id when provisioning new boards.
+ */
 void maybeRequestRoom(unsigned long now) {
   if (roomId.length()) {
     return;
@@ -1100,6 +1242,9 @@ void maybeRequestRoom(unsigned long now) {
   lastRoomPromptMs = now;
 }
 
+/**
+ * Pulls the latest desired/reported snapshot to keep version counters monotonic.
+ */
 bool seedVersionFromRedis() {
   if (!roomId.length()) {
     return false;
@@ -1174,6 +1319,9 @@ bool seedVersionFromRedis() {
   return true;
 }
 
+/**
+ * Writes the Desired snapshot to Redis and appends a stream entry.
+ */
 bool publishDesired(contracts::Desired &desired) {
   if (desired.ver <= localVer) {
     desired.ver = localVer + 1;
@@ -1196,6 +1344,9 @@ bool publishDesired(contracts::Desired &desired) {
 }
 
 
+/**
+ * Applies `ROOM_ID_OVERRIDE` so bring-up works without serial input.
+ */
 void ensureRoomFromOverride() {
 #if defined(ROOM_ID_OVERRIDE)
   if (!roomId.length() && ROOM_ID_OVERRIDE[0] != '\0') {
@@ -1207,8 +1358,12 @@ void ensureRoomFromOverride() {
 #endif
 }
 
+/** Reports whether SNTP has delivered a sane epoch time. */
 bool timeIsValid() { return time(nullptr) >= kMinValidEpoch; }
 
+/**
+ * Copies the current localtime into `out` when the clock is synchronized.
+ */
 bool acquireLocalTime(tm &out) {
   time_t now = time(nullptr);
   if (now < kMinValidEpoch) {
@@ -1218,6 +1373,9 @@ bool acquireLocalTime(tm &out) {
   return true;
 }
 
+/**
+ * Periodically configures SNTP and logs when the local clock becomes valid.
+ */
 void ensureClockSync(unsigned long now) {
   if (WiFi.status() != WL_CONNECTED) {
     return;
@@ -1235,6 +1393,9 @@ void ensureClockSync(unsigned long now) {
   }
 }
 
+/**
+ * Refreshes the cached schedule at a fixed interval while online.
+ */
 void maybeRefreshSchedule(unsigned long now) {
   if (!roomId.length() || !redis.connected()) {
     return;
@@ -1247,6 +1408,9 @@ void maybeRefreshSchedule(unsigned long now) {
   }
 }
 
+/**
+ * Safely subtracts seconds while wrapping within a 24-hour window.
+ */
 uint32_t wrapSubtract(uint32_t value, uint32_t delta) {
   if (kSecondsPerDay == 0) {
     return value;
@@ -1258,6 +1422,9 @@ uint32_t wrapSubtract(uint32_t value, uint32_t delta) {
   return value - delta;
 }
 
+/**
+ * Returns true when the provided timestamp sits inside the circular window.
+ */
 bool inWindow(uint32_t start, uint32_t end, uint32_t value) {
   if (start == end) {
     return false;
@@ -1268,6 +1435,9 @@ bool inWindow(uint32_t start, uint32_t end, uint32_t value) {
   return value >= start || value < end;
 }
 
+/**
+ * Calculates the elapsed seconds between `start` and `value` with day wrapping.
+ */
 uint32_t elapsedSince(uint32_t start, uint32_t value) {
   if (value >= start) {
     return value - start;
@@ -1275,6 +1445,9 @@ uint32_t elapsedSince(uint32_t start, uint32_t value) {
   return kSecondsPerDay - start + value;
 }
 
+/**
+ * Performs an integer linear interpolation across the configured duration.
+ */
 uint8_t lerpBrightness(uint8_t from, uint8_t to, uint32_t elapsed, uint32_t duration) {
   if (duration == 0) {
     return to;
@@ -1294,6 +1467,9 @@ uint8_t lerpBrightness(uint8_t from, uint8_t to, uint32_t elapsed, uint32_t dura
   return static_cast<uint8_t>(result);
 }
 
+/**
+ * Evaluates the sunrise/quiet-hour rules to pick the scheduled brightness.
+ */
 uint8_t evaluateScheduleBrightness(const tm &now) {
   uint32_t seconds =
       static_cast<uint32_t>(now.tm_hour) * 3600UL + static_cast<uint32_t>(now.tm_min) * 60UL +
@@ -1362,6 +1538,9 @@ uint8_t evaluateScheduleBrightness(const tm &now) {
   return clampPercent(brightness);
 }
 
+/**
+ * Publishes scheduled or override-derived Desired states when something changed.
+ */
 void maybePublishScheduledState(unsigned long now) {
   bool urgent = overridePublishHint;
   if (!urgent && (now - lastSchedulePublishMs) < kSchedulePublishIntervalMs) {
@@ -1406,6 +1585,7 @@ void maybePublishScheduledState(unsigned long now) {
 
 }  // namespace
 
+/** Arduino setup entry point: initializes hardware and shared buffers. */
 void setup() {
   consoleSerial.begin(SENDER_CONSOLE_BAUD);
   log(F("boot"));
@@ -1434,6 +1614,7 @@ void setup() {
   ensureRoomFromOverride();
 }
 
+/** Main firmware loop that orchestrates connectivity, IO, and scheduling. */
 void loop() {
   unsigned long now = millis();
   updateStatusLed(now);

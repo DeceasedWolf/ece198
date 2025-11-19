@@ -92,6 +92,9 @@ constexpr int8_t kStatusLedPin = RECEIVER_STATUS_LED_PIN;
 constexpr bool kStatusLedActiveLow = RECEIVER_STATUS_LED_ACTIVE_LOW;
 constexpr bool kStatusLedEnabled = (RECEIVER_STATUS_LED_PIN >= 0);
 
+/**
+ * Converts a percentage value into the current PWM range for analogWrite.
+ */
 constexpr uint16_t percentToDuty(uint8_t percent) {
   return static_cast<uint16_t>((static_cast<uint32_t>(percent) * PWMRANGE) / 100);
 }
@@ -125,6 +128,9 @@ constexpr LedChannel kLedChannels[] = {
 constexpr size_t kLedChannelCount = sizeof(kLedChannels) / sizeof(kLedChannels[0]);
 static_assert(kLedChannelCount > 0, "At least one LED channel must be configured");
 
+/**
+ * Reports whether the status LED shares the same physical pin as a driver channel.
+ */
 constexpr bool statusLedSharesDriverPin() {
 #if RECEIVER_LED_HAS_RGB
   return false
@@ -160,6 +166,9 @@ constexpr unsigned long kSoundWarningCooldownMs = RECEIVER_SOUND_WARNING_COOLDOW
 constexpr float kSoundAdcMax = 1023.0f;
 static_assert(kSoundSampleCount >= 1, "RECEIVER_SOUND_AVERAGE_SAMPLES must be >= 1");
 
+/**
+ * Records retry scheduling information for Wi-Fi/Redis links.
+ */
 struct Backoff {
   unsigned long nextMs = 0;
   uint8_t slot = 0;
@@ -200,6 +209,7 @@ bool timeConfigured = false;
 bool timeAnnounced = false;
 unsigned long lastTimeSyncAttemptMs = 0;
 
+/** Parsed quiet-hours schedule pulled from Redis. */
 struct QuietHoursWindow {
   bool enabled = false;
   uint16_t startMinutes = 0;
@@ -219,6 +229,9 @@ bool statusLedBlinkState = true;
 int8_t statusLedAppliedState = -1;
 unsigned long statusLedLastToggleMs = 0;
 
+/**
+ * Parses a Desired payload from JSON while logging helpful errors for operators.
+ */
 bool decodeDesiredJson(const String &payload,
                        contracts::Desired &desired,
                        const __FlashStringHelper *context) {
@@ -263,6 +276,9 @@ bool decodeDesiredJson(const String &payload,
   return true;
 }
 
+/**
+ * Lua script invoked via EVAL to map MAC addresses to room ids in Redis.
+ */
 const char kProvisionScript[] PROGMEM = R"lua(
 local dev = ARGV[1]
 local base = tonumber(ARGV[2]) or 100
@@ -282,11 +298,13 @@ end
 return rid
 )lua";
 
+/** Emits a tagged receiver log line. */
 void logInfo(const __FlashStringHelper *msg) {
   Serial.print(F("[receiver] "));
   Serial.println(msg);
 }
 
+/** Logs the most recent Redis error string with additional context. */
 void logRedisFailure(const __FlashStringHelper *where) {
   Serial.print(F("[redis] "));
   Serial.print(where);
@@ -294,14 +312,17 @@ void logRedisFailure(const __FlashStringHelper *where) {
   Serial.println(redis.lastError());
 }
 
+/** Returns the corrected duty cycle when the output is active-low. */
 uint16_t applyPolarity(uint16_t duty, bool activeLow) {
   return activeLow ? (PWMRANGE - duty) : duty;
 }
 
+/** Writes a PWM duty cycle to the supplied LED pin. */
 void writeLedDuty(uint8_t pin, uint16_t duty, bool activeLow) {
   analogWrite(pin, applyPolarity(duty, activeLow));
 }
 
+/** Drives the optional status LED without fighting LED channels that share the pin. */
 void setStatusLed(bool on) {
   if (!kStatusLedControllable) {
     return;
@@ -314,6 +335,7 @@ void setStatusLed(bool on) {
   writeLedDuty(static_cast<uint8_t>(kStatusLedPin), on ? PWMRANGE : 0, kStatusLedActiveLow);
 }
 
+/** Updates the status LED pattern based on Wi-Fi/Redis health. */
 void updateStatusLed(unsigned long now) {
   if (!kStatusLedControllable) {
     return;
@@ -346,6 +368,7 @@ void updateStatusLed(unsigned long now) {
   }
 }
 
+/** Clears cached room-specific state so resyncs start from scratch. */
 void resetRoomState(bool dropRoomId = true) {
   hasDesired = false;
   lastAppliedVer = 0;
@@ -363,12 +386,16 @@ void resetRoomState(bool dropRoomId = true) {
   }
 }
 
+/** Tears down the Redis link after logging the failure. */
 void dropRedis(const __FlashStringHelper *context) {
   logRedisFailure(context);
   redis.stop();
   resetRoomState();
 }
 
+/**
+ * Initializes the stream cursor so the receiver resumes consuming at the tail.
+ */
 bool primeStreamCursor() {
   if (!roomId.length()) {
     return false;
@@ -386,6 +413,7 @@ bool primeStreamCursor() {
   return true;
 }
 
+/** Prints the current Wi-Fi status plus IP information. */
 void logWifiSnapshot(const __FlashStringHelper *prefix) {
   Serial.print(F("[wifi] "));
   if (prefix) {
@@ -403,6 +431,7 @@ void logWifiSnapshot(const __FlashStringHelper *prefix) {
   Serial.println(WiFi.RSSI());
 }
 
+/** Connects to Wi-Fi STA mode, retrying until the link is healthy. */
 void connectWifiBlocking() {
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
@@ -426,6 +455,7 @@ void connectWifiBlocking() {
   logWifiSnapshot(F("connected (blocking)"));
 }
 
+/** Keeps Wi-Fi associated, forcing a blocking reconnect when needed. */
 bool ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiBackoff.reset();
@@ -442,6 +472,7 @@ bool ensureWifi() {
   return true;
 }
 
+/** Maintains the Redis TCP connection, authenticating and pinging before use. */
 bool ensureRedis() {
   if (redis.connected()) {
     redisBackoff.reset();
@@ -482,6 +513,7 @@ bool ensureRedis() {
   return true;
 }
 
+/** Periodically prints `ROOM:<id>` so the sender can copy/paste the assignment. */
 void announceRoom(bool force) {
   if (!roomId.length()) {
     return;
@@ -495,6 +527,9 @@ void announceRoom(bool force) {
   lastAnnounceMs = now;
 }
 
+/**
+ * Runs the provisioning script so each receiver learns which room it controls.
+ */
 bool provisionRoom() {
   if (!redis.connected()) {
     return false;
@@ -519,6 +554,9 @@ bool provisionRoom() {
   return true;
 }
 
+/**
+ * Applies a Desired snapshot to every configured LED channel.
+ */
 void applyPwm(const contracts::Desired &desired) {
   uint16_t brightnessDuty = 0;
   if (strcmp(desired.mode, "on") == 0 && desired.brightness > 0) {
@@ -534,6 +572,9 @@ void applyPwm(const contracts::Desired &desired) {
                 static_cast<unsigned>(desired.brightness));
 }
 
+/**
+ * Writes the applied Desired snapshot to both the reported key and stream.
+ */
 bool recordState(const String &json) {
   if (!redis.set(contracts::key_reported(roomId), json)) {
     dropRedis(F("set reported"));
@@ -547,6 +588,9 @@ bool recordState(const String &json) {
   return true;
 }
 
+/**
+ * Loads the latest Desired snapshot from Redis and applies it immediately.
+ */
 bool pullSnapshot() {
   bool isNull = false;
   String stored;
@@ -576,6 +620,7 @@ bool pullSnapshot() {
   return true;
 }
 
+/** Decodes a streamed command and applies it when the version is newer. */
 void handlePayload(const String &payload) {
   contracts::Desired desired = lastDesired;
   if (!decodeDesiredJson(payload, desired, F("stream"))) {
@@ -594,6 +639,9 @@ void handlePayload(const String &payload) {
   recordState(jsonScratch);
 }
 
+/**
+ * Continuously blocks on `XREAD` so new commands are applied with minimal latency.
+ */
 void pumpStream() {
   if (!roomId.length() || !hasDesired) {
     return;
@@ -620,6 +668,7 @@ void pumpStream() {
   yield();
 }
 
+/** Periodically refreshes the `room:{id}:online` key so ops can detect outages. */
 void maintainHeartbeat(unsigned long now) {
   if (!roomId.length() || !redis.connected()) {
     return;
@@ -634,10 +683,12 @@ void maintainHeartbeat(unsigned long now) {
   lastHeartbeatMs = now;
 }
 
+/** Returns true once SNTP has provided a modern epoch. */
 bool timeIsValid() {
   return time(nullptr) >= kMinValidEpoch;
 }
 
+/** Copies the current localtime into the provided tm struct. */
 bool acquireLocalTime(tm &out) {
   time_t now = time(nullptr);
   if (now < kMinValidEpoch) {
@@ -647,6 +698,7 @@ bool acquireLocalTime(tm &out) {
   return true;
 }
 
+/** Schedules SNTP sync attempts and logs when the clock locks in. */
 void ensureClockSync(unsigned long now) {
   if (WiFi.status() != WL_CONNECTED) {
     return;
@@ -664,6 +716,7 @@ void ensureClockSync(unsigned long now) {
   }
 }
 
+/** Converts bounded hour/minute inputs into total minutes since midnight. */
 uint16_t minutesFromClock(int hour, int minute) {
   if (hour < 0) {
     hour = 0;
@@ -678,6 +731,9 @@ uint16_t minutesFromClock(int hour, int minute) {
   return static_cast<uint16_t>(hour * 60 + minute);
 }
 
+/**
+ * Loads the quiet-hour schedule from Redis and records whether it is active.
+ */
 bool fetchQuietHours() {
   if (!roomId.length()) {
     return false;
@@ -732,6 +788,7 @@ bool fetchQuietHours() {
   return true;
 }
 
+/** Refreshes the quiet-hours schedule based on a timer. */
 void maybeRefreshQuietHours(unsigned long now) {
   if (!roomId.length() || !redis.connected()) {
     return;
@@ -744,6 +801,7 @@ void maybeRefreshQuietHours(unsigned long now) {
   }
 }
 
+/** Returns true when the current time falls inside the configured quiet window. */
 bool quietHoursActive(const tm &localNow) {
   if (!quietWindowLoaded || !quietWindow.enabled) {
     return false;
@@ -761,6 +819,9 @@ bool quietHoursActive(const tm &localNow) {
   return minutes >= start || minutes < end;
 }
 
+/**
+ * Samples the analog sound sensor and converts it to an estimated dB value.
+ */
 float readSoundDecibels() {
   if (!kSoundSensorEnabled) {
     return 0.0f;
@@ -787,6 +848,9 @@ float readSoundDecibels() {
   return decibels;
 }
 
+/**
+ * Serializes the quiet-hour warning payload and stores it in Redis.
+ */
 bool publishSoundWarning(float decibels, uint32_t capturedAt) {
   if (!redis.connected() || !roomId.length()) {
     return false;
@@ -815,6 +879,9 @@ bool publishSoundWarning(float decibels, uint32_t capturedAt) {
   return true;
 }
 
+/**
+ * Samples the sound sensor, checks quiet-hour state, and publishes warnings.
+ */
 void monitorSound(unsigned long now) {
   if (!kSoundSensorEnabled) {
     return;
@@ -851,6 +918,7 @@ void monitorSound(unsigned long now) {
 
 }  // namespace
 
+/** Arduino setup entry point that initializes IO and connectivity. */
 void setup() {
   Serial.begin(115200);
   delay(100);
@@ -881,6 +949,7 @@ void setup() {
   warningScratch.reserve(160);
 }
 
+/** Main firmware loop orchestrating Wi-Fi/Redis, PWM, and monitoring. */
 void loop() {
   unsigned long now = millis();
   updateStatusLed(now);

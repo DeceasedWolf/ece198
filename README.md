@@ -48,7 +48,7 @@ This repo implements a Redis-backed hospital room lighting demo that pairs two E
 - Publishes desired states to `room:{id}:desired` and `cmd:room:{id}` (trimmed to `~200` entries) and mirrors the last packet locally so drops/reconnects continue smoothly.
 - Implements the manual override hardware: a debounced button toggles override mode, while the analog potentiometer selects brightness (0–100%). Each change is written to `room:{id}:override` (`enabled`, `ver`, `updated_at`, `source=device`) so the website stays in sync.
 - Polls `room:{id}:override` to honor remote toggles from the web UI, pushes overrides immediately to the desired snapshot, and clears the override once disabled.
-- Optional UX features: an SSD1306 display (if `SENDER_DISPLAY_ENABLED`) shows current time + quiet-hour window, and a status LED blinks while Redis is healthy (solid when only Wi-Fi is linked).
+- Optional UX features: an SSD1306 display (if `SENDER_DISPLAY_ENABLED`) shows current time + quiet-hour window, temporarily swaps to a “Sound Levels Exceeded” overlay when the receiver reports excessive noise, and a status LED blinks while Redis is healthy (solid when only Wi-Fi is linked).
 
 ### ESP receiver (actuator)
 
@@ -57,6 +57,7 @@ This repo implements a Redis-backed hospital room lighting demo that pairs two E
 - Loads the latest desired snapshot, applies PWM to the configured LED channel(s), and records the applied state to both `room:{id}:reported` (overwrite) and `state:room:{id}` (stream trimmed to `~200` entries). Optional RGB wiring mixes duty cycles per channel with independent polarity and mix percentages.
 - Subscribes to `cmd:room:{id}` with `XREAD BLOCK 1000` and applies every streamed payload whose `ver` is newer than the last applied version.
 - Sends `room:{id}:online` heartbeats (TTL `contracts::kHeartbeatTtlSec`) and exposes LED/Wi-Fi/Redis health via the status LED (off = disconnected, solid = Wi-Fi only, blink = Wi-Fi + Redis).
+- Optional sound monitoring: when `RECEIVER_SOUND_SENSOR_PIN` is wired the firmware samples the analog sensor, watches for quiet-hour noise that exceeds `RECEIVER_SOUND_WARNING_THRESHOLD_DB`, and persists the latest violation to `room:{id}:latest_warning` (`decibels`, `threshold`, `quiet`, `captured_at`, etc.) so the website + sender display can alert staff.
 
 ## Room Configuration (`room:{id}:cfg`)
 
@@ -89,7 +90,8 @@ Example payload:
   - Quiet-hours form (`POST /room/{id}/quiet-hours`) that rewrites `room:{id}:cfg` with the supplied wake/sleep pair (night brightness is forced to 0 for patient comfort).
   - Manual override toggle (`POST /room/{id}/override`) that updates the override key with `source=website`.
   - Instant brightness quick actions (`POST /room/{id}/brightness`) that write `room:{id}:desired` and append `cmd:room:{id}` packets for full-on or lights-out testing.
-- `GET /api/rooms/{id}` returns `{ room, schedule, quiet, override }`, which is useful for dashboards or scripts that need the merged defaults the sender will apply.
+  - Quiet-hour sound warning card that renders the latest `room:{id}:latest_warning` payload when the receiver detects excessive noise, including timestamp, dB, and whether it happened during quiet hours.
+- `GET /api/rooms/{id}` returns `{ room, schedule, quiet, override, warning }`, which is useful for dashboards or scripts that need the merged defaults the sender will apply alongside the latest warning snapshot.
 
 ## Redis Keys and Streams
 
@@ -102,6 +104,7 @@ Example payload:
 - `state:room:{id}` – acknowledgement stream produced by the receiver (trimmed to `~200` entries).
 - `room:{id}:override` – manual override snapshot (enabled flag, version counter, last writer).
 - `room:{id}:online` – heartbeat key with TTL `contracts::kHeartbeatTtlSec` so operators can detect offline rooms quickly.
+- `room:{id}:latest_warning` – latest quiet-hour sound warning payload with `{ decibels, threshold, captured_at, quiet, source }`.
 
 ## Useful `redis-cli` Snippets
 
@@ -116,6 +119,9 @@ redis-cli XREAD BLOCK 0 STREAMS state:room:101 $
 # Inspect quiet hours + override
 redis-cli GET room:101:cfg | jq .
 redis-cli GET room:101:override | jq .
+
+# Latest quiet-hour sound warning (if a sensor is wired)
+redis-cli GET room:101:latest_warning | jq .
 
 # Heartbeat (returns 1 while the receiver is online)
 redis-cli EXISTS room:101:online
