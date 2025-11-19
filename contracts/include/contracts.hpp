@@ -27,6 +27,9 @@ inline String key_desired(const String &roomId) { return makeRoomKey(roomId, ":d
 inline String key_reported(const String &roomId) { return makeRoomKey(roomId, ":reported"); }
 inline String key_online(const String &roomId) { return makeRoomKey(roomId, ":online"); }
 inline String key_override(const String &roomId) { return makeRoomKey(roomId, ":override"); }
+inline String key_latest_warning(const String &roomId) {
+  return makeRoomKey(roomId, ":latest_warning");
+}
 
 inline String stream_cmd(const String &roomId) {
   String key("cmd:room:");

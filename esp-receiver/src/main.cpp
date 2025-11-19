@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ArduinoJson.h>
+#include <time.h>
 
 #include "config.h"
 #include "contracts.hpp"
@@ -45,6 +46,31 @@ constexpr uint16_t kRedisTimeoutMs = 1500;
 #endif
 #ifndef RECEIVER_STATUS_LED_ACTIVE_LOW
 #define RECEIVER_STATUS_LED_ACTIVE_LOW 1
+#endif
+
+#ifndef RECEIVER_CFG_REFRESH_MS
+#define RECEIVER_CFG_REFRESH_MS 60000
+#endif
+#ifndef RECEIVER_SOUND_SENSOR_PIN
+#define RECEIVER_SOUND_SENSOR_PIN -1
+#endif
+#ifndef RECEIVER_SOUND_SAMPLE_INTERVAL_MS
+#define RECEIVER_SOUND_SAMPLE_INTERVAL_MS 200
+#endif
+#ifndef RECEIVER_SOUND_AVERAGE_SAMPLES
+#define RECEIVER_SOUND_AVERAGE_SAMPLES 4
+#endif
+#ifndef RECEIVER_SOUND_SENSOR_MIN_DB
+#define RECEIVER_SOUND_SENSOR_MIN_DB 30.0f
+#endif
+#ifndef RECEIVER_SOUND_SENSOR_MAX_DB
+#define RECEIVER_SOUND_SENSOR_MAX_DB 110.0f
+#endif
+#ifndef RECEIVER_SOUND_WARNING_THRESHOLD_DB
+#define RECEIVER_SOUND_WARNING_THRESHOLD_DB 80.0f
+#endif
+#ifndef RECEIVER_SOUND_WARNING_COOLDOWN_MS
+#define RECEIVER_SOUND_WARNING_COOLDOWN_MS 60000
 #endif
 #ifndef RECEIVER_LED_HAS_RGB
 #if (RECEIVER_LED_RED_PIN >= 0) || (RECEIVER_LED_GREEN_PIN >= 0) || (RECEIVER_LED_BLUE_PIN >= 0)
@@ -120,6 +146,19 @@ constexpr bool statusLedSharesDriverPin() {
 constexpr bool kStatusLedSharesDriver = kStatusLedEnabled && statusLedSharesDriverPin();
 constexpr bool kStatusLedControllable = kStatusLedEnabled && !kStatusLedSharesDriver;
 constexpr unsigned long kStatusLedBlinkIntervalMs = 400;
+constexpr unsigned long kQuietConfigRefreshMs = RECEIVER_CFG_REFRESH_MS;
+constexpr bool kSoundSensorEnabled = (RECEIVER_SOUND_SENSOR_PIN >= 0);
+constexpr unsigned long kSoundSampleIntervalMs = RECEIVER_SOUND_SAMPLE_INTERVAL_MS;
+constexpr uint8_t kSoundSampleCount =
+    (RECEIVER_SOUND_AVERAGE_SAMPLES >= 1 ? RECEIVER_SOUND_AVERAGE_SAMPLES : 1);
+constexpr uint16_t kMinutesPerDay = 24 * 60;
+constexpr time_t kMinValidEpoch = 1609459200;
+constexpr float kSoundMinDb = RECEIVER_SOUND_SENSOR_MIN_DB;
+constexpr float kSoundMaxDb = RECEIVER_SOUND_SENSOR_MAX_DB;
+constexpr float kSoundThresholdDb = RECEIVER_SOUND_WARNING_THRESHOLD_DB;
+constexpr unsigned long kSoundWarningCooldownMs = RECEIVER_SOUND_WARNING_COOLDOWN_MS;
+constexpr float kSoundAdcMax = 1023.0f;
+static_assert(kSoundSampleCount >= 1, "RECEIVER_SOUND_AVERAGE_SAMPLES must be >= 1");
 
 struct Backoff {
   unsigned long nextMs = 0;
@@ -156,6 +195,23 @@ unsigned long lastHeartbeatMs = 0;
 unsigned long lastAnnounceMs = 0;
 String jsonScratch;
 bool wifiAnnounced = false;
+String warningScratch;
+bool timeConfigured = false;
+bool timeAnnounced = false;
+unsigned long lastTimeSyncAttemptMs = 0;
+
+struct QuietHoursWindow {
+  bool enabled = false;
+  uint16_t startMinutes = 0;
+  uint16_t endMinutes = 0;
+  uint32_t version = 0;
+};
+
+QuietHoursWindow quietWindow;
+bool quietWindowLoaded = false;
+unsigned long lastQuietFetchMs = 0;
+unsigned long lastSoundSampleMs = 0;
+unsigned long lastWarningPublishedMs = 0;
 
 enum class StatusLedMode { Off, Solid, Blink };
 StatusLedMode statusLedMode = StatusLedMode::Off;
@@ -297,6 +353,11 @@ void resetRoomState(bool dropRoomId = true) {
   lastAnnounceMs = 0;
   streamCursorValid = false;
   lastStreamId.remove(0);
+  quietWindow = QuietHoursWindow();
+  quietWindowLoaded = false;
+  lastQuietFetchMs = 0;
+  lastSoundSampleMs = 0;
+  lastWarningPublishedMs = 0;
   if (dropRoomId) {
     roomId.remove(0);
   }
@@ -573,6 +634,221 @@ void maintainHeartbeat(unsigned long now) {
   lastHeartbeatMs = now;
 }
 
+bool timeIsValid() {
+  return time(nullptr) >= kMinValidEpoch;
+}
+
+bool acquireLocalTime(tm &out) {
+  time_t now = time(nullptr);
+  if (now < kMinValidEpoch) {
+    return false;
+  }
+  localtime_r(&now, &out);
+  return true;
+}
+
+void ensureClockSync(unsigned long now) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if (!timeConfigured || (!timeIsValid() && (now - lastTimeSyncAttemptMs) > 10000)) {
+    configTime(TZ_OFFSET_SECONDS, DST_OFFSET_SECONDS, NTP_SERVER_PRIMARY, NTP_SERVER_SECONDARY,
+               NTP_SERVER_TERTIARY);
+    timeConfigured = true;
+    lastTimeSyncAttemptMs = now;
+    Serial.println(F("[time] requested SNTP sync"));
+  }
+  if (timeIsValid() && !timeAnnounced) {
+    Serial.println(F("[time] clock synchronized"));
+    timeAnnounced = true;
+  }
+}
+
+uint16_t minutesFromClock(int hour, int minute) {
+  if (hour < 0) {
+    hour = 0;
+  } else if (hour > 23) {
+    hour = 23;
+  }
+  if (minute < 0) {
+    minute = 0;
+  } else if (minute > 59) {
+    minute = 59;
+  }
+  return static_cast<uint16_t>(hour * 60 + minute);
+}
+
+bool fetchQuietHours() {
+  if (!roomId.length()) {
+    return false;
+  }
+  String payload;
+  bool isNull = false;
+  if (!redis.get(contracts::key_cfg(roomId), payload, &isNull)) {
+    dropRedis(F("get cfg"));
+    return false;
+  }
+  QuietHoursWindow next;
+  next.startMinutes =
+      minutesFromClock(SCHEDULE_DEFAULT_NIGHT_HOUR, SCHEDULE_DEFAULT_NIGHT_MINUTE);
+  next.endMinutes = minutesFromClock(SCHEDULE_DEFAULT_WAKE_HOUR, SCHEDULE_DEFAULT_WAKE_MINUTE);
+  next.enabled = true;
+  next.version = 0;
+  if (!isNull && payload.length()) {
+    StaticJsonDocument<384> doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (err) {
+      Serial.print(F("[quiet] cfg json error: "));
+      Serial.println(err.c_str());
+    } else {
+      JsonVariantConst night = doc["night"];
+      JsonVariantConst wake = doc["wake"];
+      bool nightEnabled = night["enabled"] | true;
+      bool wakeEnabled = wake["enabled"] | true;
+      next.startMinutes =
+          minutesFromClock(night["hour"] | SCHEDULE_DEFAULT_NIGHT_HOUR,
+                           night["minute"] | SCHEDULE_DEFAULT_NIGHT_MINUTE);
+      next.endMinutes = minutesFromClock(wake["hour"] | SCHEDULE_DEFAULT_WAKE_HOUR,
+                                         wake["minute"] | SCHEDULE_DEFAULT_WAKE_MINUTE);
+      next.enabled = nightEnabled && wakeEnabled;
+      next.version = doc["version"] | doc["cfg_ver"] | 0;
+    }
+  }
+  if (next.startMinutes == next.endMinutes) {
+    next.enabled = false;
+  }
+  quietWindow = next;
+  quietWindowLoaded = true;
+  Serial.print(F("[quiet] window "));
+  Serial.print(quietWindow.enabled ? F("enabled") : F("disabled"));
+  Serial.print(F(" start="));
+  Serial.print(quietWindow.startMinutes / 60);
+  Serial.print(':');
+  Serial.print(quietWindow.startMinutes % 60);
+  Serial.print(F(" end="));
+  Serial.print(quietWindow.endMinutes / 60);
+  Serial.print(':');
+  Serial.println(quietWindow.endMinutes % 60);
+  return true;
+}
+
+void maybeRefreshQuietHours(unsigned long now) {
+  if (!roomId.length() || !redis.connected()) {
+    return;
+  }
+  if (quietWindowLoaded && (now - lastQuietFetchMs) < kQuietConfigRefreshMs) {
+    return;
+  }
+  if (fetchQuietHours()) {
+    lastQuietFetchMs = now;
+  }
+}
+
+bool quietHoursActive(const tm &localNow) {
+  if (!quietWindowLoaded || !quietWindow.enabled) {
+    return false;
+  }
+  uint16_t minutes =
+      static_cast<uint16_t>(((localNow.tm_hour % 24) * 60) + (localNow.tm_min % 60));
+  uint16_t start = quietWindow.startMinutes % kMinutesPerDay;
+  uint16_t end = quietWindow.endMinutes % kMinutesPerDay;
+  if (start == end) {
+    return false;
+  }
+  if (start < end) {
+    return minutes >= start && minutes < end;
+  }
+  return minutes >= start || minutes < end;
+}
+
+float readSoundDecibels() {
+  if (!kSoundSensorEnabled) {
+    return 0.0f;
+  }
+  uint32_t accumulator = 0;
+  for (uint8_t i = 0; i < kSoundSampleCount; ++i) {
+    uint16_t reading = static_cast<uint16_t>(analogRead(RECEIVER_SOUND_SENSOR_PIN));
+    accumulator += reading;
+    delayMicroseconds(200);
+  }
+  float average = static_cast<float>(accumulator) / static_cast<float>(kSoundSampleCount);
+  if (average < 0.0f) {
+    average = 0.0f;
+  } else if (average > kSoundAdcMax) {
+    average = kSoundAdcMax;
+  }
+  float normalized = average / kSoundAdcMax;
+  float decibels = kSoundMinDb + normalized * (kSoundMaxDb - kSoundMinDb);
+  if (decibels < kSoundMinDb) {
+    decibels = kSoundMinDb;
+  } else if (decibels > kSoundMaxDb) {
+    decibels = kSoundMaxDb;
+  }
+  return decibels;
+}
+
+bool publishSoundWarning(float decibels, uint32_t capturedAt) {
+  if (!redis.connected() || !roomId.length()) {
+    return false;
+  }
+  StaticJsonDocument<192> doc;
+  doc["room"] = roomId;
+  doc["decibels"] = decibels;
+  doc["threshold"] = kSoundThresholdDb;
+  doc["captured_at"] = capturedAt;
+  doc["quiet"] = true;
+  doc["source"] = F("receiver");
+  doc["quiet_start_min"] = quietWindow.startMinutes;
+  doc["quiet_end_min"] = quietWindow.endMinutes;
+  doc["cfg_ver"] = quietWindow.version;
+  warningScratch.remove(0);
+  if (serializeJson(doc, warningScratch) == 0) {
+    return false;
+  }
+  if (!redis.set(contracts::key_latest_warning(roomId), warningScratch)) {
+    dropRedis(F("set warning"));
+    return false;
+  }
+  Serial.print(F("[sound] warning "));
+  Serial.print(decibels, 1);
+  Serial.println(F(" dB"));
+  return true;
+}
+
+void monitorSound(unsigned long now) {
+  if (!kSoundSensorEnabled) {
+    return;
+  }
+  if ((now - lastSoundSampleMs) < kSoundSampleIntervalMs) {
+    return;
+  }
+  lastSoundSampleMs = now;
+  float decibels = readSoundDecibels();
+  Serial.print(F("[sound] sample "));
+  Serial.print(decibels, 1);
+  Serial.println(F(" dB"));
+  if (!roomId.length() || !redis.connected() || !quietWindowLoaded || !quietWindow.enabled) {
+    return;
+  }
+  tm localNow;
+  if (!acquireLocalTime(localNow) || !quietHoursActive(localNow)) {
+    return;
+  }
+  if (decibels < kSoundThresholdDb) {
+    return;
+  }
+  time_t epoch = time(nullptr);
+  if (epoch < kMinValidEpoch) {
+    return;
+  }
+  if ((now - lastWarningPublishedMs) < kSoundWarningCooldownMs) {
+    return;
+  }
+  if (publishSoundWarning(decibels, static_cast<uint32_t>(epoch))) {
+    lastWarningPublishedMs = now;
+  }
+}
+
 }  // namespace
 
 void setup() {
@@ -583,6 +859,9 @@ void setup() {
   for (const auto &channel : kLedChannels) {
     pinMode(channel.pin, OUTPUT);
     writeLedDuty(channel.pin, 0, kLedActiveLow);
+  }
+  if (kSoundSensorEnabled) {
+    pinMode(RECEIVER_SOUND_SENSOR_PIN, INPUT);
   }
   if (kStatusLedControllable) {
     pinMode(static_cast<uint8_t>(kStatusLedPin), OUTPUT);
@@ -599,6 +878,7 @@ void setup() {
   deviceId = WiFi.macAddress();
   randomSeed(ESP.getChipId());
   jsonScratch.reserve(128);
+  warningScratch.reserve(160);
 }
 
 void loop() {
@@ -608,6 +888,7 @@ void loop() {
     delay(25);
     return;
   }
+  ensureClockSync(now);
   if (!ensureRedis()) {
     delay(25);
     return;
@@ -620,5 +901,7 @@ void loop() {
   }
   maintainHeartbeat(now);
   announceRoom(false);
+  maybeRefreshQuietHours(now);
   pumpStream();
+  monitorSound(now);
 }

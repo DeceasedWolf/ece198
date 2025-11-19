@@ -44,6 +44,16 @@
 #define RECEIVER_STATUS_LED_PIN LED_BUILTIN
 #define RECEIVER_STATUS_LED_ACTIVE_LOW 1
 
+// Quiet-hours + sound monitoring (receiver).
+#define RECEIVER_CFG_REFRESH_MS 60000
+#define RECEIVER_SOUND_SENSOR_PIN A0
+#define RECEIVER_SOUND_SAMPLE_INTERVAL_MS 200
+#define RECEIVER_SOUND_AVERAGE_SAMPLES 8
+#define RECEIVER_SOUND_SENSOR_MIN_DB 30.0f
+#define RECEIVER_SOUND_SENSOR_MAX_DB 110.0f
+#define RECEIVER_SOUND_WARNING_THRESHOLD_DB 80.0f
+#define RECEIVER_SOUND_WARNING_COOLDOWN_MS 15000
+
 // ESP sender console + scheduling defaults.
 #define SENDER_CONSOLE_BAUD 115200
 #define SCHEDULE_REFRESH_MS 30000
@@ -58,6 +68,9 @@
 #define SCHEDULE_DEFAULT_BASELINE_BRIGHTNESS 0
 #define QUIET_HOURS_DIM_MINUTES 90
 #define WAKE_BRIGHTEN_MINUTES 30
+
+// Warning banner duration for the sender display (milliseconds).
+#define SOUND_WARNING_DISPLAY_MS 15000
 
 // Manual override (control panel hardware).
 #define OVERRIDE_POT_PIN A0

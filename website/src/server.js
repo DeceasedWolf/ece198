@@ -314,6 +314,26 @@ function parseTimeInput(value) {
   return { hour, minute };
 }
 
+function formatDateTime(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+    return '';
+  }
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function formatNumber(value, fractionDigits = 0) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  return value.toFixed(fractionDigits);
+}
+
 function clampBrightness(value) {
   const num = Number(value);
   if (Number.isNaN(num) || num <= 0) {
@@ -344,6 +364,39 @@ function readDesiredPayload(payload) {
   }
 }
 
+function readWarningPayload(payload) {
+  if (!payload) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(payload);
+    const decibels = typeof parsed.decibels === 'number' ? parsed.decibels : null;
+    const capturedAt = typeof parsed.captured_at === 'number' ? parsed.captured_at : null;
+    if (decibels === null || capturedAt === null) {
+      return null;
+    }
+    const threshold = typeof parsed.threshold === 'number' ? parsed.threshold : null;
+    const quiet = Boolean(parsed.quiet);
+    const source = typeof parsed.source === 'string' ? parsed.source : 'receiver';
+    const date = new Date(capturedAt * 1000);
+    if (Number.isNaN(date.getTime())) {
+      return null;
+    }
+    return {
+      decibels,
+      threshold,
+      captured_at: capturedAt,
+      quiet,
+      source,
+      captured_at_iso: date.toISOString(),
+      display_time: formatDateTime(date)
+    };
+  } catch (err) {
+    console.warn('[website] invalid warning JSON, ignoring');
+    return null;
+  }
+}
+
 function quietTimesFromSchedule(schedule) {
   const sleep = formatTime(schedule.night.hour, schedule.night.minute);
   const wake = formatTime(schedule.wake.hour, schedule.wake.minute);
@@ -354,6 +407,11 @@ async function loadSchedule(roomId) {
   const key = roomConfigKey(roomId);
   const payload = await redis.get(key);
   return readSchedulePayload(payload);
+}
+
+async function loadLatestWarning(roomId) {
+  const payload = await redis.get(roomWarningKey(roomId));
+  return readWarningPayload(payload);
 }
 
 async function saveSchedule(roomId, schedule) {
@@ -379,6 +437,10 @@ function roomDesiredKey(roomId) {
 
 function roomCommandStream(roomId) {
   return `cmd:room:${roomId}`;
+}
+
+function roomWarningKey(roomId) {
+  return `room:${roomId}:latest_warning`;
 }
 
 async function getOverrideState(roomId) {
@@ -440,9 +502,10 @@ async function sendBrightnessCommand(roomId, brightness, source = 'website') {
 }
 
 async function loadRoomState(roomId) {
-  const [schedule, override] = await Promise.all([loadSchedule(roomId), getOverrideState(roomId)]);
+  const [schedule, override, warning] =
+      await Promise.all([loadSchedule(roomId), getOverrideState(roomId), loadLatestWarning(roomId)]);
   const quiet = quietTimesFromSchedule(schedule);
-  return { schedule, quiet, override };
+  return { schedule, quiet, override, warning };
 }
 
 async function readRequestBody(req, limitBytes = 4096) {
@@ -510,6 +573,27 @@ function roomRedirectLocation(roomId, statusCode, anchor) {
   return `${base}${query}${hash}`;
 }
 
+function renderWarningCard(warning) {
+  if (!warning) {
+    return '<p>No quiet-hour sound warnings have been recorded.</p>';
+  }
+  const hasThreshold = typeof warning.threshold === 'number' && Number.isFinite(warning.threshold);
+  const decibelText = formatNumber(warning.decibels, 1) || 'N/A';
+  const thresholdText = hasThreshold ? formatNumber(warning.threshold, 0) : '80';
+  const timeLabel = warning.display_time || warning.captured_at_iso || 'Unknown time';
+  const timeText = htmlEscape(timeLabel);
+  const isoDetail =
+      warning.captured_at_iso ? `<span class="warning-note">${htmlEscape(warning.captured_at_iso)}</span>` : '';
+  const sourceText = htmlEscape(warning.source || 'receiver');
+  const quietText = warning.quiet ? 'During quiet hours' : 'Outside quiet hours';
+  return `<div class="warning-card">
+    <div class="warning-title">Sound Levels Exceeded</div>
+    <p>${timeText}${isoDetail ? `<br>${isoDetail}` : ''}</p>
+    <p><strong>${htmlEscape(decibelText)} dB</strong> (threshold ${htmlEscape(thresholdText)} dB)</p>
+    <p class="warning-note">${quietText} · Source: ${sourceText}</p>
+  </div>`;
+}
+
 function renderRoomPage(roomId, state, statusCode) {
   const message = renderStatusMessage(statusCode);
   const overrideLabel = state.override.enabled ? 'enabled' : 'disabled';
@@ -536,6 +620,9 @@ function renderRoomPage(roomId, state, statusCode) {
     .override-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
     .quick-actions { display: flex; gap: 0.75rem; flex-wrap: wrap; }
     .quick-actions form { flex-direction: row; gap: 0; }
+    .warning-card { border-radius: 0.5rem; border: 1px solid #fecaca; background: #fef2f2; color: #7f1d1d; padding: 1rem; }
+    .warning-title { font-weight: 600; margin-bottom: 0.5rem; font-size: 1rem; }
+    .warning-note { color: #b91c1c; font-size: 0.85rem; }
   </style>
 </head>
 <body>
@@ -556,6 +643,10 @@ function renderRoomPage(roomId, state, statusCode) {
       </label>
       <button type="submit" class="primary">Save Quiet Hours</button>
     </form>
+  </section>
+  <section id="sound-warning">
+    <h2>Quiet-Hour Sound Monitoring</h2>
+    ${renderWarningCard(state.warning)}
   </section>
   <section id="override">
     <h2>Manual Override</h2>

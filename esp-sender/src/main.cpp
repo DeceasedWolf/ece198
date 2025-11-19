@@ -96,6 +96,10 @@
 #define WAKE_BRIGHTEN_MINUTES 30
 #endif
 
+#ifndef SOUND_WARNING_DISPLAY_MS
+#define SOUND_WARNING_DISPLAY_MS 15000
+#endif
+
 #ifndef OVERRIDE_POT_PIN
 #define OVERRIDE_POT_PIN A0
 #endif
@@ -181,6 +185,8 @@ constexpr bool kStatusLedEnabled = (SENDER_STATUS_LED_PIN >= 0);
 constexpr bool kStatusLedControllable = kStatusLedEnabled;
 constexpr unsigned long kStatusLedBlinkIntervalMs = 400;
 
+void dropRedis(const __FlashStringHelper *context);
+
 #if SENDER_DISPLAY_ENABLED
 constexpr uint8_t kDisplayWidth = SENDER_DISPLAY_WIDTH;
 constexpr uint8_t kDisplayHeight = SENDER_DISPLAY_HEIGHT;
@@ -193,6 +199,11 @@ constexpr uint8_t kDisplaySclPin = SENDER_DISPLAY_SCL_PIN;
 Adafruit_SSD1306 senderDisplay(kDisplayWidth, kDisplayHeight, &Wire, kDisplayResetPin);
 bool displayReady = false;
 unsigned long lastDisplayRefreshMs = 0;
+constexpr unsigned long kWarningOverlayDurationMs = SOUND_WARNING_DISPLAY_MS;
+constexpr unsigned long kWarningRefreshIntervalMs = 2000;
+constexpr size_t kWarningJsonCapacity = 320;
+constexpr uint32_t kWarningFreshWindowSec = 90;
+constexpr unsigned long kWarningTimeGateMs = 8000;
 
 struct DisplayPayload {
   char current[12]{};
@@ -200,9 +211,21 @@ struct DisplayPayload {
   char quietEnd[12]{};
   bool quietEnabled = false;
   bool timeValid = false;
+  bool warningActive = false;
 };
 
 DisplayPayload lastDisplayPayload{};
+struct SoundWarningState {
+  uint32_t capturedAt = 0;
+  float decibels = 0.0f;
+};
+SoundWarningState latestWarning;
+unsigned long warningOverlayUntilMs = 0;
+unsigned long lastWarningFetchMs = 0;
+unsigned long warningFetchGateStartMs = 0;
+bool warningFetchGateOpen = false;
+bool warningBootstrapPending = true;
+String warningFetchJson;
 #endif
 
 HardwareSerial &consoleSerial = Serial;
@@ -241,6 +264,7 @@ bool overridePublishHint = false;
 bool desiredForcePublish = false;
 
 bool acquireLocalTime(tm &out);
+bool timeIsValid();
 
 struct OverrideState {
   bool enabled = false;
@@ -321,7 +345,8 @@ void formatCurrentTime(const tm &now, char *dst, size_t len) {
 }
 
 bool payloadChanged(const DisplayPayload &a, const DisplayPayload &b) {
-  if (a.timeValid != b.timeValid || a.quietEnabled != b.quietEnabled) {
+  if (a.timeValid != b.timeValid || a.quietEnabled != b.quietEnabled ||
+      a.warningActive != b.warningActive) {
     return true;
   }
   if (std::strcmp(a.current, b.current) != 0) {
@@ -340,6 +365,15 @@ void renderDisplay(const DisplayPayload &payload) {
   if (!displayReady) {
     return;
   }
+  if (payload.warningActive) {
+    senderDisplay.clearDisplay();
+    senderDisplay.setTextColor(SSD1306_WHITE);
+    senderDisplay.setTextSize(1);
+    senderDisplay.setCursor(0, 26);
+    senderDisplay.println(F("Sound Levels Exceeded"));
+    senderDisplay.display();
+    return;
+  }
   senderDisplay.clearDisplay();
   senderDisplay.setTextColor(SSD1306_WHITE);
   senderDisplay.setTextSize(2);
@@ -356,6 +390,13 @@ void renderDisplay(const DisplayPayload &payload) {
 }
 
 void composeDisplayPayload(DisplayPayload &payload) {
+  unsigned long nowMs = millis();
+  if (warningOverlayUntilMs > 0) {
+    long remaining = static_cast<long>(warningOverlayUntilMs - nowMs);
+    payload.warningActive = remaining > 0;
+  } else {
+    payload.warningActive = false;
+  }
   tm localNow;
   payload.timeValid = acquireLocalTime(localNow);
   if (payload.timeValid) {
@@ -407,6 +448,88 @@ void maybeUpdateDisplay(unsigned long now) {
   }
   renderDisplay(payload);
   lastDisplayPayload = payload;
+}
+
+bool decodeWarningJson(const String &payload, SoundWarningState &out) {
+  StaticJsonDocument<kWarningJsonCapacity> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    logSerial.print(F("[display] warning parse failed: "));
+    logSerial.println(err.c_str());
+    return false;
+  }
+  uint32_t captured = doc["captured_at"] | 0;
+  float decibels = doc["decibels"] | 0.0f;
+  if (captured == 0) {
+    return false;
+  }
+  out.capturedAt = captured;
+  out.decibels = decibels;
+  return true;
+}
+
+bool warningIsFresh(const SoundWarningState &state) {
+  if (!timeIsValid()) {
+    return true;
+  }
+  time_t nowEpoch = time(nullptr);
+  if (nowEpoch < static_cast<time_t>(state.capturedAt)) {
+    return true;
+  }
+  uint32_t age = static_cast<uint32_t>(nowEpoch - state.capturedAt);
+  return age <= kWarningFreshWindowSec;
+}
+
+void maybeFetchLatestWarning(unsigned long now) {
+  if (!roomId.length() || !redis.connected()) {
+    return;
+  }
+  if (!warningFetchGateOpen) {
+    if (warningFetchGateStartMs == 0) {
+      warningFetchGateStartMs = now;
+    }
+    bool timeReady = timeIsValid();
+    if (timeReady || (now - warningFetchGateStartMs) >= kWarningTimeGateMs) {
+      warningFetchGateOpen = true;
+    } else {
+      return;
+    }
+  }
+  if ((now - lastWarningFetchMs) < kWarningRefreshIntervalMs) {
+    return;
+  }
+  lastWarningFetchMs = now;
+  bool isNull = false;
+  if (!redis.get(contracts::key_latest_warning(roomId), warningFetchJson, &isNull)) {
+    dropRedis(F("get warning"));
+    return;
+  }
+  if (isNull || !warningFetchJson.length()) {
+    if (warningBootstrapPending) {
+      warningBootstrapPending = false;
+    }
+    return;
+  }
+  SoundWarningState next;
+  if (!decodeWarningJson(warningFetchJson, next)) {
+    return;
+  }
+  if (next.capturedAt <= latestWarning.capturedAt) {
+    return;
+  }
+  bool fresh = warningIsFresh(next);
+  latestWarning = next;
+  if (warningBootstrapPending && !fresh) {
+    warningBootstrapPending = false;
+    return;
+  }
+  warningBootstrapPending = false;
+  if (!fresh) {
+    return;
+  }
+  warningOverlayUntilMs = now + kWarningOverlayDurationMs;
+  logSerial.printf("[display] sound warning %.1f dB\n", latestWarning.decibels);
+  lastDisplayRefreshMs = 0;
 }
 #endif
 
@@ -480,6 +603,14 @@ void resetState() {
   overrideMirror = OverrideMirror();
   overrideDirty = false;
   lastOverrideFetchMs = 0;
+#if SENDER_DISPLAY_ENABLED
+  latestWarning = SoundWarningState();
+  warningOverlayUntilMs = 0;
+  lastWarningFetchMs = 0;
+  warningFetchGateStartMs = 0;
+  warningFetchGateOpen = false;
+  warningBootstrapPending = true;
+#endif
 }
 
 void dropRedis(const __FlashStringHelper *context) {
@@ -1297,6 +1428,9 @@ void setup() {
   randomSeed(ESP.getChipId());
   jsonScratch.reserve(192);
   overrideJsonScratch.reserve(128);
+#if SENDER_DISPLAY_ENABLED
+  warningFetchJson.reserve(160);
+#endif
   ensureRoomFromOverride();
 }
 
@@ -1323,6 +1457,9 @@ void loop() {
   ensureRoomFromOverride();
   ensureClockSync(now);
   maybeRefreshSchedule(now);
+#if SENDER_DISPLAY_ENABLED
+  maybeFetchLatestWarning(now);
+#endif
   maybeFetchOverrideState(now);
   maybePublishOverrideState();
   maybePublishScheduledState(now);
